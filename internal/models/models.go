@@ -2,10 +2,31 @@ package models
 
 // OpenAI Models
 
+type Function struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description,omitempty"`
+	Parameters  map[string]interface{} `json:"parameters,omitempty"` // Gebruikt bij definities (JSON Schema)
+	Arguments   interface{}            `json:"arguments,omitempty"`  // Gebruikt bij tool calls (JSON String)
+}
+
+type Tool struct {
+	Type     string   `json:"type"`
+	Function Function `json:"function"`
+}
+
+type ToolCall struct {
+	ID       string   `json:"id"`
+	Type     string   `json:"type"`
+	Function Function `json:"function"`
+}
+
 type OpenAIChatMessage struct {
 	Role             string      `json:"role"`
 	Content          interface{} `json:"content"` // Can be string or []ContentPart
 	ReasoningContent string      `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall  `json:"tool_calls,omitempty"`
+	ToolCallID       string      `json:"tool_call_id,omitempty"`
+	Name             string      `json:"name,omitempty"`
 }
 
 type ContentPart struct {
@@ -21,6 +42,8 @@ type ImageURL struct {
 type OpenAIChatCompletionRequest struct {
 	Model            string                 `json:"model"`
 	Messages         []OpenAIChatMessage    `json:"messages"`
+	Tools            []Tool                 `json:"tools,omitempty"`
+	ToolChoice       interface{}            `json:"tool_choice,omitempty"`
 	Stream           bool                   `json:"stream,omitempty"`
 	Temperature      *float64               `json:"temperature,omitempty"`
 	TopP             *float64               `json:"top_p,omitempty"`
@@ -48,8 +71,9 @@ type OpenAIChatCompletionResponse struct {
 }
 
 type OpenAIDelta struct {
-	Content          string `json:"content,omitempty"`
-	ReasoningContent string `json:"reasoning_content,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type OpenAIChatCompletionStreamChoice struct {
@@ -69,9 +93,21 @@ type OpenAIChatCompletionStreamResponse struct {
 // Gemini Models
 
 type GeminiPart struct {
-	Text       string            `json:"text,omitempty"`
-	Thought    bool              `json:"thought,omitempty"`
-	InlineData *GeminiInlineData `json:"inlineData,omitempty"`
+	Text             string                  `json:"text,omitempty"`
+	Thought          bool                    `json:"thought,omitempty"`
+	InlineData       *GeminiInlineData       `json:"inlineData,omitempty"`
+	FunctionCall     *GeminiFunctionCall     `json:"functionCall,omitempty"`
+	FunctionResponse *GeminiFunctionResponse `json:"functionResponse,omitempty"`
+}
+
+type GeminiFunctionCall struct {
+	Name string                 `json:"name"`
+	Args map[string]interface{} `json:"args"`
+}
+
+type GeminiFunctionResponse struct {
+	Name     string                 `json:"name"`
+	Response map[string]interface{} `json:"response"`
 }
 
 type GeminiInlineData struct {
@@ -85,7 +121,11 @@ type GeminiContent struct {
 }
 
 type GeminiRequest struct {
-	Contents []GeminiContent `json:"contents"`
+	Contents         []GeminiContent          `json:"contents"`
+	Tools            []map[string]interface{} `json:"tools,omitempty"`
+	GenerationConfig map[string]interface{}   `json:"generationConfig,omitempty"`
+	SafetySettings   []map[string]interface{} `json:"safetySettings,omitempty"`
+	Model            string                   `json:"model,omitempty"`
 }
 
 type GeminiCandidate struct {

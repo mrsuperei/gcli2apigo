@@ -1,6 +1,7 @@
 package transformers
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"regexp"
@@ -15,6 +16,23 @@ import (
 
 // OpenAIRequestToGemini transforms an OpenAI chat completion request to Gemini format
 func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]interface{} {
+	var tools []map[string]interface{}
+	if len(req.Tools) > 0 {
+		functionDeclarations := make([]map[string]interface{}, 0)
+		for _, t := range req.Tools {
+			if t.Type == "function" {
+				functionDeclarations = append(functionDeclarations, map[string]interface{}{
+					"name":        t.Function.Name,
+					"description": t.Function.Description,
+					"parameters":  t.Function.Parameters,
+				})
+			}
+		}
+		// Gemini verwacht tools gewikkeld in "function_declarations"
+		tools = append(tools, map[string]interface{}{
+			"function_declarations": functionDeclarations,
+		})
+	}
 	contents := make([]map[string]interface{}, 0)
 
 	// Process each message in the conversation
@@ -29,45 +47,80 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 		}
 
 		parts := make([]map[string]interface{}, 0)
+		// Specifieke handling voor Tool Responses (OpenAI: role="tool" -> Gemini: role="function")
+		if role == "tool" {
+			role = "function" // Gemini gebruikt soms 'user' context of specifieke 'function' role afhankelijk van versie, check docs voor v1beta
 
-		// Handle different content types
-		switch content := message.Content.(type) {
-		case string:
-			// Simple text content; extract Markdown images
-			parts = extractMarkdownImages(content)
+			// Gemini verwacht functionResponse structuur
+			parts = append(parts, map[string]interface{}{
+				"functionResponse": map[string]interface{}{
+					"name": message.Name, // OpenAI stuurt dit soms niet mee in de 'tool' message, je moet dit mogelijk cachen of uit context halen
+					"response": map[string]interface{}{
+						"content": message.Content, // JSON object of string
+					},
+				},
+			})
+		} else if len(message.ToolCalls) > 0 {
+			// Handling Assistant die een Tool Call doet (historie)
+			role = "model"
+			for _, tc := range message.ToolCalls {
+				// Parse arguments string naar map, want Gemini wil een object, geen string
+				var argsMap map[string]interface{}
+				// Probeer de argument string te parsen. Als het faalt, stuur lege map.
+				// tc.Function.Arguments is een string in OpenAI models
+				if argsStr, ok := tc.Function.Arguments.(string); ok {
+					_ = json.Unmarshal([]byte(argsStr), &argsMap)
+				} else if argsMapRaw, ok := tc.Function.Arguments.(map[string]interface{}); ok {
+					// Als het al een map is (intern gebruik)
+					argsMap = argsMapRaw
+				}
 
-		case []interface{}:
-			// List of content parts
-			for _, part := range content {
-				if partMap, ok := part.(map[string]interface{}); ok {
-					if partType, _ := partMap["type"].(string); partType == "text" {
-						if text, ok := partMap["text"].(string); ok {
-							parts = append(parts, extractMarkdownImages(text)...)
-						}
-					} else if partType == "image_url" {
-						if imageURL, ok := partMap["image_url"].(map[string]interface{}); ok {
-							if url, ok := imageURL["url"].(string); ok {
-								imagePart := parseDataURI(url)
-								if imagePart != nil {
-									parts = append(parts, imagePart)
+				parts = append(parts, map[string]interface{}{
+					"functionCall": map[string]interface{}{
+						"name": tc.Function.Name,
+						"args": argsMap,
+					},
+				})
+			}
+		} else {
+			// Handle different content types
+			switch content := message.Content.(type) {
+			case string:
+				// Simple text content; extract Markdown images
+				parts = extractMarkdownImages(content)
+
+			case []interface{}:
+				// List of content parts
+				for _, part := range content {
+					if partMap, ok := part.(map[string]interface{}); ok {
+						if partType, _ := partMap["type"].(string); partType == "text" {
+							if text, ok := partMap["text"].(string); ok {
+								parts = append(parts, extractMarkdownImages(text)...)
+							}
+						} else if partType == "image_url" {
+							if imageURL, ok := partMap["image_url"].(map[string]interface{}); ok {
+								if url, ok := imageURL["url"].(string); ok {
+									imagePart := parseDataURI(url)
+									if imagePart != nil {
+										parts = append(parts, imagePart)
+									}
 								}
 							}
 						}
 					}
 				}
 			}
-		}
 
-		if len(parts) == 0 {
-			parts = append(parts, map[string]interface{}{"text": ""})
-		}
+			if len(parts) == 0 {
+				parts = append(parts, map[string]interface{}{"text": ""})
+			}
 
-		contents = append(contents, map[string]interface{}{
-			"role":  role,
-			"parts": parts,
-		})
+			contents = append(contents, map[string]interface{}{
+				"role":  role,
+				"parts": parts,
+			})
+		}
 	}
-
 	// Map OpenAI generation parameters to Gemini format
 	generationConfig := make(map[string]interface{})
 
@@ -134,12 +187,19 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 		"safetySettings":   config.DefaultSafetySettings,
 		"model":            req.Model,
 	}
+	if len(tools) > 0 {
+		requestPayload["tools"] = tools
+	}
 
 	return requestPayload
 }
 
 // GeminiResponseToOpenAI transforms a Gemini API response to OpenAI chat completion format
 func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map[string]interface{} {
+	if config.IsDebugEnabled() {
+		respBytes, _ := json.MarshalIndent(geminiResp, "", "  ")
+		log.Printf("[DEBUG] Raw Gemini Response: %s", string(respBytes))
+	}
 	choices := make([]map[string]interface{}, 0)
 
 	candidates, _ := geminiResp["candidates"].([]interface{})
@@ -153,13 +213,34 @@ func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map
 			role = "assistant"
 		}
 
-		// Extract and separate thinking tokens from regular content
+		// Extract and separate thinking tokens from regular content and tool calls
 		parts, _ := content["parts"].([]interface{})
 		contentParts := make([]string, 0)
+		toolCalls := make([]map[string]interface{}, 0)
 		reasoningContent := ""
 
 		for _, part := range parts {
 			partMap, _ := part.(map[string]interface{})
+
+			// Check for Function Call
+			if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
+				name, _ := fnCall["name"].(string)
+				args, _ := fnCall["args"].(map[string]interface{})
+
+				// OpenAI verwacht argumenten als JSON string, Gemini geeft een object.
+				// We moeten het object terug converteren naar een JSON string.
+				argsBytes, _ := json.Marshal(args)
+
+				toolCalls = append(toolCalls, map[string]interface{}{
+					"id":   "call_" + uuid.New().String(),
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      name,
+						"arguments": string(argsBytes),
+					},
+				})
+				continue
+			}
 
 			// Text parts (may include thinking tokens)
 			if text, ok := partMap["text"].(string); ok {
@@ -193,6 +274,15 @@ func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map
 			"content": contentStr,
 		}
 
+		// Add tool_calls if present
+		if len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+			// Als er tool calls zijn, is content vaak null of leeg in OpenAI spec
+			if contentStr == "" {
+				message["content"] = nil
+			}
+		}
+
 		// Add reasoning_content if there are thinking tokens
 		if reasoningContent != "" {
 			message["reasoning_content"] = reasoningContent
@@ -201,10 +291,16 @@ func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map
 		index, _ := candMap["index"].(float64)
 		finishReason, _ := candMap["finishReason"].(string)
 
+		// Override finish reason als we tool calls hebben
+		finalFinishReason := mapFinishReason(finishReason)
+		if len(toolCalls) > 0 {
+			finalFinishReason = "tool_calls"
+		}
+
 		choices = append(choices, map[string]interface{}{
 			"index":         int(index),
 			"message":       message,
-			"finish_reason": mapFinishReason(finishReason),
+			"finish_reason": finalFinishReason,
 		})
 	}
 
@@ -235,10 +331,30 @@ func GeminiStreamChunkToOpenAI(geminiChunk map[string]interface{}, model string,
 		// Extract and separate thinking tokens from regular content
 		parts, _ := content["parts"].([]interface{})
 		contentParts := make([]string, 0)
+		toolCalls := make([]map[string]interface{}, 0)
 		reasoningContent := ""
 
 		for _, part := range parts {
 			partMap, _ := part.(map[string]interface{})
+
+			// Check for Function Call
+			if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
+				name, _ := fnCall["name"].(string)
+				args, _ := fnCall["args"].(map[string]interface{})
+
+				argsBytes, _ := json.Marshal(args)
+
+				toolCalls = append(toolCalls, map[string]interface{}{
+					"index": 0, // In stream chunks, meestal index 0 voor de eerste tool call
+					"id":    "call_" + responseID,
+					"type":  "function",
+					"function": map[string]interface{}{
+						"name":      name,
+						"arguments": string(argsBytes),
+					},
+				})
+				continue
+			}
 
 			// Text parts (may include thinking tokens)
 			if text, ok := partMap["text"].(string); ok {
@@ -274,14 +390,22 @@ func GeminiStreamChunkToOpenAI(geminiChunk map[string]interface{}, model string,
 		if reasoningContent != "" {
 			delta["reasoning_content"] = reasoningContent
 		}
+		if len(toolCalls) > 0 {
+			delta["tool_calls"] = toolCalls
+		}
 
 		index, _ := candMap["index"].(float64)
 		finishReason, _ := candMap["finishReason"].(string)
 
+		finalFinishReason := mapFinishReason(finishReason)
+		if len(toolCalls) > 0 {
+			finalFinishReason = "tool_calls"
+		}
+
 		choices = append(choices, map[string]interface{}{
 			"index":         int(index),
 			"delta":         delta,
-			"finish_reason": mapFinishReason(finishReason),
+			"finish_reason": finalFinishReason,
 		})
 	}
 
@@ -429,6 +553,7 @@ func AssembleCompleteResponse(chunks []map[string]interface{}, model string) map
 				candidateMap[candIndex] = &candidateAccumulator{
 					index:            candIndex,
 					contentParts:     make([]string, 0),
+					toolCalls:        make([]map[string]interface{}, 0),
 					reasoningContent: "",
 					finishReason:     "",
 					role:             "",
@@ -448,6 +573,24 @@ func AssembleCompleteResponse(chunks []map[string]interface{}, model string) map
 			parts, _ := content["parts"].([]interface{})
 			for _, part := range parts {
 				partMap, _ := part.(map[string]interface{})
+
+				// Check for Function Call
+				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
+					name, _ := fnCall["name"].(string)
+					args, _ := fnCall["args"].(map[string]interface{})
+					argsBytes, _ := json.Marshal(args)
+
+					// Append to accumulated tool calls
+					acc.toolCalls = append(acc.toolCalls, map[string]interface{}{
+						"id":   "call_" + uuid.New().String(),
+						"type": "function",
+						"function": map[string]interface{}{
+							"name":      name,
+							"arguments": string(argsBytes),
+						},
+					})
+					continue
+				}
 
 				// Text parts (may include thinking tokens)
 				if text, ok := partMap["text"].(string); ok {
@@ -499,15 +642,28 @@ func AssembleCompleteResponse(chunks []map[string]interface{}, model string) map
 				"content": contentStr,
 			}
 
+			// Add tool_calls
+			if len(acc.toolCalls) > 0 {
+				message["tool_calls"] = acc.toolCalls
+				if contentStr == "" {
+					message["content"] = nil
+				}
+			}
+
 			// Add reasoning_content if there are thinking tokens
 			if acc.reasoningContent != "" {
 				message["reasoning_content"] = acc.reasoningContent
 			}
 
+			finishReason := mapFinishReason(acc.finishReason)
+			if len(acc.toolCalls) > 0 {
+				finishReason = "tool_calls"
+			}
+
 			choices = append(choices, map[string]interface{}{
 				"index":         acc.index,
 				"message":       message,
-				"finish_reason": mapFinishReason(acc.finishReason),
+				"finish_reason": finishReason,
 			})
 		}
 	}
@@ -525,8 +681,8 @@ func AssembleCompleteResponse(chunks []map[string]interface{}, model string) map
 type candidateAccumulator struct {
 	index            int
 	contentParts     []string
+	toolCalls        []map[string]interface{}
 	reasoningContent string
 	finishReason     string
 	role             string
 }
-

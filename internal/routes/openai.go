@@ -656,17 +656,17 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 	responseID := "chatcmpl-" + uuid.New().String()
 	log.Printf("Starting streaming response: %s", responseID)
 
-	// OPTIMALISATIE: Eenvoudigere buffering strategie
-	// Buffer chunks voor max 20ms of tot 2KB, wat eerst komt
+	// Buffer voor tekst chunks
 	var textBuffer strings.Builder
-	textBuffer.Grow(2048) // Pre-allocate 2KB
+	textBuffer.Grow(2048)
 
 	lastFlush := time.Now()
 	const (
-		maxBufferTime = 20 * time.Millisecond // Sneller flushen
-		maxBufferSize = 2048                  // Kleinere buffer
+		maxBufferTime = 20 * time.Millisecond
+		maxBufferSize = 2048
 	)
 
+	// Helper functie om tekst buffer te flushen
 	flushBuffer := func() {
 		if textBuffer.Len() == 0 {
 			return
@@ -697,6 +697,11 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 	}
 
 	for chunk := range streamChan {
+		// DEBUG LOG: Hiermee zie je eindelijk wat Gemini terugstuurt
+		if config.IsDebugEnabled() {
+			log.Printf("[DEBUG] Raw Stream Chunk: %s", chunk)
+		}
+
 		var geminiChunk map[string]interface{}
 		if err := json.Unmarshal([]byte(chunk), &geminiChunk); err != nil {
 			continue
@@ -721,6 +726,48 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 
 			for _, part := range parts {
 				partMap, _ := part.(map[string]interface{})
+
+				// 1. Check voor Function Call
+				// Gemini stuurt dit soms als "functionCall" (camelCase)
+				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
+					flushBuffer() // Eerst tekst wegwerken
+
+					name, _ := fnCall["name"].(string)
+					args, _ := fnCall["args"].(map[string]interface{})
+					argsBytes, _ := json.Marshal(args)
+
+					toolChunk := map[string]interface{}{
+						"id":      responseID,
+						"object":  "chat.completion.chunk",
+						"created": time.Now().Unix(),
+						"model":   request.Model,
+						"choices": []map[string]interface{}{
+							{
+								"index": 0,
+								"delta": map[string]interface{}{
+									"tool_calls": []map[string]interface{}{
+										{
+											"index": 0,
+											"id":    "call_" + uuid.New().String(),
+											"type":  "function",
+											"function": map[string]interface{}{
+												"name":      name,
+												"arguments": string(argsBytes),
+											},
+										},
+									},
+								},
+								"finish_reason": nil,
+							},
+						},
+					}
+					jsonData, _ := json.Marshal(toolChunk)
+					fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+					flusher.Flush()
+					continue
+				}
+
+				// 2. Check voor normale tekst
 				if text, ok := partMap["text"].(string); ok {
 					if thought, _ := partMap["thought"].(bool); !thought {
 						textBuffer.WriteString(text)
@@ -732,6 +779,13 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 				hasFinish = true
 				flushBuffer()
 
+				finalFinishReason := transformers.MapFinishReason(finishReason)
+
+				// Als er tool calls zijn geweest in dit bericht, is de finish reason vaak tool_calls
+				// Maar in streaming moeten we oppassen. Als Gemini "STOP" stuurt na een tool call,
+				// kan de client "tool_calls" verwachten.
+				// Voor nu mappen we de standaard Gemini reasons.
+
 				finishChunk := map[string]interface{}{
 					"id":      responseID,
 					"object":  "chat.completion.chunk",
@@ -741,7 +795,7 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 						{
 							"index":         0,
 							"delta":         map[string]interface{}{},
-							"finish_reason": transformers.MapFinishReason(finishReason),
+							"finish_reason": finalFinishReason,
 						},
 					},
 				}
@@ -751,7 +805,6 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			}
 		}
 
-		// OPTIMALISATIE: Flush op tijd OF grootte (wat eerst)
 		if !hasFinish && (time.Since(lastFlush) >= maxBufferTime || textBuffer.Len() >= maxBufferSize) {
 			flushBuffer()
 		}
