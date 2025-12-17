@@ -606,8 +606,10 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 	flusher.Flush()
 }
 
+// WIJZIGING IN openai.go - vervang handleStreamingChatCompletion functie
+// Dit vermindert de buffering overhead voor snellere streaming
+
 func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
-	// Set headers for SSE
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -619,7 +621,6 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 		return
 	}
 
-	// Send request to Gemini API
 	result, err := client.SendGeminiRequest(geminiPayload, true)
 	if err != nil {
 		errorData := map[string]interface{}{
@@ -655,33 +656,23 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 	responseID := "chatcmpl-" + uuid.New().String()
 	log.Printf("Starting streaming response: %s", responseID)
 
-	// Smart buffering: accumulate text and flush on sentence boundaries or time
-	var textAccumulator strings.Builder
-	textAccumulator.Grow(8 * 1024) // Pre-allocate 8KB
+	// OPTIMALISATIE: Eenvoudigere buffering strategie
+	// Buffer chunks voor max 20ms of tot 2KB, wat eerst komt
+	var textBuffer strings.Builder
+	textBuffer.Grow(2048) // Pre-allocate 2KB
 
-	lastFlushTime := time.Now()
-	flushInterval := 50 * time.Millisecond
+	lastFlush := time.Now()
+	const (
+		maxBufferTime = 20 * time.Millisecond // Sneller flushen
+		maxBufferSize = 2048                  // Kleinere buffer
+	)
 
-	// Sentence boundary detection
-	isSentenceBoundary := func(text string) bool {
-		if len(text) == 0 {
-			return false
-		}
-		// Check last rune for sentence boundaries (supports Unicode)
-		runes := []rune(text)
-		lastRune := runes[len(runes)-1]
-		return lastRune == '.' || lastRune == '!' || lastRune == '?' ||
-			lastRune == '。' || lastRune == '！' || lastRune == '？' ||
-			lastRune == '\n'
-	}
-
-	sendAccumulatedText := func() {
-		if textAccumulator.Len() == 0 {
+	flushBuffer := func() {
+		if textBuffer.Len() == 0 {
 			return
 		}
 
-		// Create OpenAI chunk with accumulated text
-		openaiChunk := map[string]interface{}{
+		chunk := map[string]interface{}{
 			"id":      responseID,
 			"object":  "chat.completion.chunk",
 			"created": time.Now().Unix(),
@@ -690,19 +681,19 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 				{
 					"index": 0,
 					"delta": map[string]interface{}{
-						"content": textAccumulator.String(),
+						"content": textBuffer.String(),
 					},
 					"finish_reason": nil,
 				},
 			},
 		}
 
-		jsonData, _ := json.Marshal(openaiChunk)
+		jsonData, _ := json.Marshal(chunk)
 		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
 		flusher.Flush()
 
-		textAccumulator.Reset()
-		lastFlushTime = time.Now()
+		textBuffer.Reset()
+		lastFlush = time.Now()
 	}
 
 	for chunk := range streamChan {
@@ -711,20 +702,18 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			continue
 		}
 
-		// Check if this is an error chunk
 		if errObj, ok := geminiChunk["error"]; ok {
-			sendAccumulatedText() // Flush any pending text
-			errorData := map[string]interface{}{
-				"error": errObj,
-			}
+			flushBuffer()
+			errorData := map[string]interface{}{"error": errObj}
 			jsonData, _ := json.Marshal(errorData)
 			fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
 			flusher.Flush()
 			break
 		}
 
-		// Extract text from Gemini chunk
 		candidates, _ := geminiChunk["candidates"].([]interface{})
+		hasFinish := false
+
 		for _, candidate := range candidates {
 			candMap, _ := candidate.(map[string]interface{})
 			content, _ := candMap["content"].(map[string]interface{})
@@ -733,18 +722,16 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			for _, part := range parts {
 				partMap, _ := part.(map[string]interface{})
 				if text, ok := partMap["text"].(string); ok {
-					// Skip thinking tokens
 					if thought, _ := partMap["thought"].(bool); !thought {
-						textAccumulator.WriteString(text)
+						textBuffer.WriteString(text)
 					}
 				}
 			}
 
-			// Check finish reason
 			if finishReason, ok := candMap["finishReason"].(string); ok && finishReason != "" {
-				sendAccumulatedText() // Flush before sending finish
+				hasFinish = true
+				flushBuffer()
 
-				// Send finish chunk
 				finishChunk := map[string]interface{}{
 					"id":      responseID,
 					"object":  "chat.completion.chunk",
@@ -764,23 +751,13 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			}
 		}
 
-		// Flush conditions:
-		// 1. Sentence boundary detected
-		// 2. Time interval exceeded (50ms)
-		// 3. Buffer size exceeded (8KB safety limit)
-		currentText := textAccumulator.String()
-		timeSinceFlush := time.Since(lastFlushTime)
-
-		if isSentenceBoundary(currentText) ||
-			timeSinceFlush >= flushInterval ||
-			textAccumulator.Len() >= 8*1024 {
-			sendAccumulatedText()
+		// OPTIMALISATIE: Flush op tijd OF grootte (wat eerst)
+		if !hasFinish && (time.Since(lastFlush) >= maxBufferTime || textBuffer.Len() >= maxBufferSize) {
+			flushBuffer()
 		}
 	}
 
-	sendAccumulatedText() // Final flush
-
-	// Send the final [DONE] marker
+	flushBuffer() // Final flush
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	log.Printf("Completed streaming response: %s", responseID)

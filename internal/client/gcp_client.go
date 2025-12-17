@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/net/proxy"
@@ -37,32 +38,55 @@ type projectsResponse struct {
 	NextPageToken string    `json:"nextPageToken"`
 }
 
-// NewGCPClient creates a new GCP client with the provided OAuth token
-func NewGCPClient(token *oauth2.Token) *GCPClient {
-	// Create transport with proxy support
-	transport := &http.Transport{
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     5 * time.Minute,
-	}
+var (
+	sharedGCPHTTPClient     *http.Client
+	sharedGCPHTTPClientOnce sync.Once
+)
 
-	// Configure proxy if environment variable is set
-	if proxyURL := getProxyURL(); proxyURL != nil {
-		if strings.HasPrefix(proxyURL.Scheme, "socks5") {
-			// SOCKS5 proxy requires special handling
-			configureSocks5ProxyForGCP(transport, proxyURL)
-		} else {
-			// HTTP/HTTPS proxy
-			transport.Proxy = http.ProxyURL(proxyURL)
+// getSharedGCPClient retourneert de gedeelde GCP HTTP client (thread-safe singleton)
+func getSharedGCPClient() *http.Client {
+	sharedGCPHTTPClientOnce.Do(func() {
+		transport := &http.Transport{
+			// Optimalisatie: hogere limits voor GCP APIs
+			MaxIdleConns:        200,
+			MaxIdleConnsPerHost: 50,
+			IdleConnTimeout:     5 * time.Minute,
+
+			// Connection optimalisaties
+			TLSHandshakeTimeout:   5 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+
+			DisableKeepAlives:  false,
+			DisableCompression: false,
 		}
-	}
 
-	return &GCPClient{
-		httpClient: &http.Client{
+		// Configure proxy if needed
+		if proxyURL := getProxyURL(); proxyURL != nil {
+			if strings.HasPrefix(proxyURL.Scheme, "socks5") {
+				configureSocks5ProxyForGCP(transport, proxyURL)
+			} else {
+				transport.Proxy = http.ProxyURL(proxyURL)
+			}
+		}
+
+		sharedGCPHTTPClient = &http.Client{
 			Timeout:   30 * time.Second,
 			Transport: transport,
-		},
-		token: token,
+		}
+
+		log.Printf("[INFO] Initialized shared GCP HTTP client with connection pooling")
+	})
+
+	return sharedGCPHTTPClient
+}
+
+// NewGCPClient creates a new GCP client with the provided OAuth token
+// GEOPTIMALISEERD: hergebruikt shared HTTP client
+func NewGCPClient(token *oauth2.Token) *GCPClient {
+	return &GCPClient{
+		httpClient: getSharedGCPClient(),
+		token:      token,
 	}
 }
 

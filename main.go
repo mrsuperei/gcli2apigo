@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,11 +10,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gcli2apigo/internal/auth"
 	"gcli2apigo/internal/banlist"
 	"gcli2apigo/internal/config"
 	"gcli2apigo/internal/dashboard"
+	"gcli2apigo/internal/httputil"
 	"gcli2apigo/internal/i18n"
 	"gcli2apigo/internal/routes"
 	"gcli2apigo/internal/usage"
@@ -39,7 +42,32 @@ func main() {
 
 	// Reload config to pick up values from .env
 	config.ReloadConfig()
+	log.Println("[INFO] Initializing HTTP connection warmer...")
 
+	endpoints := []string{
+		config.GetCodeAssistEndpoint(),
+		config.GetOAuth2Endpoint(),
+		config.GetCloudResourceManagerEndpoint(),
+		config.GetServiceUsageEndpoint(),
+	}
+
+	httputil.InitializeWarmer(endpoints)
+	go func() {
+		time.Sleep(1 * time.Second) // Wacht tot warmer klaar is
+		if credEntry, err := auth.GetCredentialForRequest(); err == nil {
+			if !credEntry.Token.Expiry.Before(time.Now()) && credEntry.Token.AccessToken != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				defer cancel()
+				httputil.GlobalWarmer.WarmUpWithCredentials(
+					ctx,
+					credEntry.Token.AccessToken,
+					config.GetCodeAssistEndpoint(),
+				)
+			}
+		}
+	}()
+
+	log.Println("[INFO] Connection warming completed, starting server...")
 	// Get server configuration
 	host := os.Getenv("HOST")
 	if host == "" {

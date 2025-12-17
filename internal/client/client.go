@@ -21,6 +21,27 @@ import (
 	"golang.org/x/oauth2"
 )
 
+// ============ OPTIMALISATIE: Buffer Pool voor JSON encoding ============
+var jsonEncoderPool = sync.Pool{
+	New: func() interface{} {
+		return &bytes.Buffer{}
+	},
+}
+
+// getBufferFromPool haalt een buffer uit de pool
+func getBufferFromPool() *bytes.Buffer {
+	buf := jsonEncoderPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	return buf
+}
+
+// returnBufferToPool retourneert buffer naar pool
+func returnBufferToPool(buf *bytes.Buffer) {
+	if buf.Cap() < 64*1024 { // Alleen kleine buffers hergebruiken
+		jsonEncoderPool.Put(buf)
+	}
+}
+
 // TokenRefreshManager manages token refresh operations with per-credential locking
 // to ensure only one refresh happens per credential even with concurrent requests
 type TokenRefreshManager struct {
@@ -84,7 +105,10 @@ func (trm *TokenRefreshManager) RefreshToken(credEntry *auth.CredentialEntry) er
 		},
 	}
 
-	tokenSource := oauthConfig.TokenSource(context.Background(), credEntry.Token)
+	// OPTIMALISATIE: Gebruik dedicated OAuth HTTP client met context
+	ctx := httputil.GetOAuthContext(context.Background())
+	tokenSource := oauthConfig.TokenSource(ctx, credEntry.Token)
+
 	newToken, err := tokenSource.Token()
 	if err != nil {
 		log.Printf("[WARN] Token refresh failed for credential %s: %v", credEntry.FilePath, err)
@@ -113,60 +137,54 @@ var (
 // Process: 1. Randomly obtain OAuth credential, 2. Refresh token if needed, 3. Make API request, 4. Return
 // If a 429 error occurs, automatically retry with different OAuth credentials until success or all credentials exhausted
 func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
-	// Track which credentials have been tried to avoid retrying the same one
-	triedCredentials := make(map[string]bool)
-
 	// Extract model name for usage tracking
 	modelName := ""
 	if model, ok := payload["model"].(string); ok {
 		modelName = model
 	}
 
+	// Start performance monitoring
+	perfTimer := NewPerformanceTimer(modelName)
+	defer perfTimer.LogSummary()
+
+	// Track which credentials have been tried to avoid retrying the same one
+	triedCredentials := make(map[string]bool)
+
 	// Retry loop: try different credentials on 429 errors
-	// Limited by MAX_RETRY_ATTEMPTS (default: 5)
-	// This is read dynamically to allow runtime updates without restart
 	maxRetries := config.GetMaxRetryAttempts()
 	if maxRetries <= 0 {
-		maxRetries = 5 // Ensure at least 1 attempt
+		maxRetries = 5
 	}
 
-	// Track if we've already tried reloading credentials
 	hasReloadedCredentials := false
 
 	for {
 		// Step 1: Randomly obtain an OAuth credential from the oauth_creds folder
 		credEntry, err := auth.GetCredentialForRequest()
 		if err != nil {
-			// Check if error is due to no credentials available
 			if strings.Contains(err.Error(), "no credentials available") || strings.Contains(err.Error(), "credential pool not initialized") {
-				// Try reloading credentials once if we haven't already
 				if !hasReloadedCredentials {
 					log.Printf("[WARN] No credentials available, attempting to reload credential pool...")
 					if reloadErr := auth.ReloadCredentialPool(); reloadErr != nil {
 						log.Printf("[ERROR] Failed to reload credential pool: %v", reloadErr)
-						log.Printf("[ERROR] Credential selection failed: %v", err)
 						return nil, fmt.Errorf("credential selection failed: %v", err)
 					}
 
 					hasReloadedCredentials = true
 					log.Printf("[INFO] Credential pool reloaded, retrying credential selection...")
 
-					// Retry getting credentials after reload
 					credEntry, err = auth.GetCredentialForRequest()
 					if err != nil {
 						log.Printf("[ERROR] Still no credentials available after reload: %v", err)
 						return nil, fmt.Errorf("credential selection failed: %v", err)
 					}
 
-					// Successfully got credentials after reload, continue with request
 					log.Printf("[INFO] Successfully selected credential after reload: %s", credEntry.ProjectID)
 				} else {
-					// Already tried reloading, return error
 					log.Printf("[ERROR] Credential selection failed: %v", err)
 					return nil, fmt.Errorf("credential selection failed: %v", err)
 				}
 			} else {
-				// Different error, return immediately
 				log.Printf("[ERROR] Credential selection failed: %v", err)
 				return nil, fmt.Errorf("credential selection failed: %v", err)
 			}
@@ -174,28 +192,29 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 
 		// Check if we've already tried this credential
 		if triedCredentials[credEntry.ProjectID] {
-			// Check if we've reached max retry attempts or tried all available credentials
 			poolSize := auth.GetCredentialPoolSize()
 			if len(triedCredentials) >= maxRetries || len(triedCredentials) >= poolSize {
 				log.Printf("[ERROR] Retry limit reached: tried %d credentials (max: %d, pool size: %d)",
 					len(triedCredentials), maxRetries, poolSize)
 				return nil, fmt.Errorf("rate limit exceeded: retry limit reached after %d attempts", len(triedCredentials))
 			}
-			// Skip this credential and try to get another one
 			continue
 		}
 
-		// Mark this credential as tried
 		triedCredentials[credEntry.ProjectID] = true
 
 		creds := credEntry.Token
 		projID := credEntry.ProjectID
+
+		// Mark credential selection complete
+		perfTimer.MarkCredentialSelect(projID)
+
 		if config.IsDebugEnabled() {
 			log.Printf("[DEBUG] Selected credential from: %s (project: %s) [attempt %d/%d]",
 				credEntry.FilePath, projID, len(triedCredentials), auth.GetCredentialPoolSize())
 		}
 
-		// Step 2: Refresh the token if needed (expired OR no access token)
+		// Step 2: Refresh the token if needed
 		needsRefresh := creds.Expiry.Before(time.Now()) || creds.AccessToken == ""
 
 		if needsRefresh && creds.RefreshToken != "" {
@@ -207,17 +226,16 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 				}
 			}
 
-			// Use TokenRefreshManager to handle refresh with per-credential locking
+			refreshStart := perfTimer.MarkTokenRefreshStart()
 			err := globalTokenRefreshManager.RefreshToken(credEntry)
+			perfTimer.MarkTokenRefreshEnd(refreshStart)
+
 			if err != nil {
 				log.Printf("Warning: Token refresh failed for credential %s: %v", credEntry.FilePath, err)
 				if creds.AccessToken == "" {
-					// Try next credential
 					continue
 				}
-				// Continue with existing token as per requirement 2.4
 			} else {
-				// Token was refreshed successfully, update local reference
 				creds = credEntry.Token
 			}
 		} else if creds.AccessToken == "" {
@@ -229,39 +247,40 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 			}
 		}
 
-		// Step 3: Make API request (onboarding and actual request)
-
-		// Onboard user with selected credential
+		// Step 3: Onboard user
+		onboardStart := perfTimer.MarkOnboardingStart()
 		err = auth.OnboardUser(creds, projID)
+		perfTimer.MarkOnboardingEnd(onboardStart)
+
 		if err != nil {
-			// Check if it's a 401 error and try refreshing the token
 			if strings.Contains(err.Error(), "401") && creds.RefreshToken != "" {
 				if config.IsDebugEnabled() {
 					log.Printf("[DEBUG] Got 401 during onboarding, forcing token refresh...")
 				}
 
-				// Reset onboarding state since credentials are invalid
 				auth.ResetOnboardingState()
 
-				// Use TokenRefreshManager to handle refresh with per-credential locking
+				refreshStart := perfTimer.MarkTokenRefreshStart()
 				refreshErr := globalTokenRefreshManager.RefreshToken(credEntry)
+				perfTimer.MarkTokenRefreshEnd(refreshStart)
+
 				if refreshErr != nil {
 					log.Printf("Warning: Failed to refresh token after 401: %v", refreshErr)
-					// Try next credential
 					continue
 				}
 
 				if config.IsDebugEnabled() {
 					log.Printf("[DEBUG] Token refreshed after 401, retrying onboarding...")
 				}
-				// Update local reference to refreshed token
 				creds = credEntry.Token
 
-				// Retry onboarding with refreshed token
+				onboardRetryStart := perfTimer.MarkOnboardingStart()
 				if retryErr := auth.OnboardUser(creds, projID); retryErr != nil {
 					log.Printf("[WARN] Failed to onboard user after token refresh: %v, trying next credential", retryErr)
 					continue
 				}
+				perfTimer.MarkOnboardingEnd(onboardRetryStart)
+
 				if config.IsDebugEnabled() {
 					log.Printf("[DEBUG] Onboarding successful after token refresh")
 				}
@@ -283,7 +302,7 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 			"request": requestData,
 		}
 
-		// Determine the action and URL using strings.Builder to avoid allocations
+		// Determine the action and URL
 		action := "generateContent"
 		if isStreaming {
 			action = "streamGenerateContent"
@@ -301,41 +320,48 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 
 		log.Printf("[DEBUG] Gemini API request - Endpoint: %s, Action: %s, Full URL: %s", endpoint, action, targetURL)
 
-		// Build request
-		jsonData, err := json.Marshal(finalPayload)
+		// Build request with buffer pool
+		buf := getBufferFromPool()
+		defer returnBufferToPool(buf)
+
+		enc := json.NewEncoder(buf)
+		if err := enc.Encode(finalPayload); err != nil {
+			return nil, err
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(ctx, "POST", targetURL, buf)
 		if err != nil {
 			return nil, err
 		}
 
-		req, err := http.NewRequest("POST", targetURL, bytes.NewBuffer(jsonData))
-		if err != nil {
-			return nil, err
-		}
-
-		// Use strings.Builder to avoid string allocation in hot path
-		var authHeader strings.Builder
-		authHeader.WriteString("Bearer ")
-		authHeader.WriteString(creds.AccessToken)
-		req.Header.Set("Authorization", authHeader.String())
+		req.Header.Set("Authorization", "Bearer "+creds.AccessToken)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("User-Agent", config.GetUserAgent())
+		req.Header.Set("Connection", "keep-alive")
 
-		// Send the request using the shared HTTP client
+		// ===== START TIMING ACTUAL GEMINI API CALL =====
+		apiStart := perfTimer.MarkAPIRequestStart()
 		resp, err := httputil.SharedHTTPClient.Do(req)
+		perfTimer.MarkAPIRequestEnd(apiStart)
+		// ===== END TIMING ACTUAL GEMINI API CALL =====
+
 		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				return nil, fmt.Errorf("request timeout after 5 minutes: %v", err)
+			}
 			return nil, fmt.Errorf("request failed: %v", err)
 		}
 
-		// Check for 429 error and retry with different credential
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
 			log.Printf("[WARN] Received 429 (Too Many Requests) for project %s, retrying with different credential... (attempt %d/%d)",
 				projID, len(triedCredentials), maxRetries)
 
-			// Track error code for this project
 			usage.GetTracker().SetErrorCode(projID, resp.StatusCode)
 
-			// Check if we've reached max retry attempts or tried all credentials
 			poolSize := auth.GetCredentialPoolSize()
 			if len(triedCredentials) >= maxRetries || len(triedCredentials) >= poolSize {
 				log.Printf("[ERROR] Retry limit reached: tried %d credentials (max: %d, pool size: %d)",
@@ -343,7 +369,6 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 				return nil, fmt.Errorf("rate limit exceeded: retry limit reached after %d attempts", len(triedCredentials))
 			}
 
-			// Continue to next iteration to try another credential
 			continue
 		}
 
@@ -365,7 +390,6 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 				log.Printf("[DEBUG] Usage tracked for project %s (model: %s, isPro: %v)", projID, modelName, isProModel)
 			}
 		} else if resp.StatusCode != http.StatusOK {
-			// Track error code for this project
 			usage.GetTracker().SetErrorCode(projID, resp.StatusCode)
 			if config.IsDebugEnabled() {
 				log.Printf("[DEBUG] Error code %d tracked for project %s", resp.StatusCode, projID)
