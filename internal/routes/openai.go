@@ -71,7 +71,6 @@ func (ca *ChunkAccumulator) GetComplete() map[string]interface{} {
 		return nil
 	}
 
-	// Merge all chunks - implementation in subtask 2.2
 	return ca.mergeChunks()
 }
 
@@ -221,69 +220,6 @@ func isFakeStreamingAllowed(modelName string) bool {
 	}
 
 	return false
-}
-
-// KeepAliveManager manages periodic keep-alive signals during fake stream collection
-type KeepAliveManager struct {
-	interval time.Duration
-	stopChan chan struct{}
-	writer   http.ResponseWriter
-	flusher  http.Flusher
-	mu       sync.Mutex
-	stopOnce sync.Once
-}
-
-// NewKeepAliveManager creates a new KeepAliveManager
-func NewKeepAliveManager(interval time.Duration, writer http.ResponseWriter, flusher http.Flusher) *KeepAliveManager {
-	return &KeepAliveManager{
-		interval: interval,
-		stopChan: make(chan struct{}),
-		writer:   writer,
-		flusher:  flusher,
-	}
-}
-
-// Start begins sending keep-alive signals at the configured interval
-func (kam *KeepAliveManager) Start() {
-	go func() {
-		ticker := time.NewTicker(kam.interval)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-ticker.C:
-				if err := kam.sendKeepAlive(); err != nil {
-					log.Printf("Failed to send keep-alive signal: %v", err)
-					return
-				}
-			case <-kam.stopChan:
-				return
-			}
-		}
-	}()
-}
-
-// Stop stops the keep-alive goroutine (safe to call multiple times)
-func (kam *KeepAliveManager) Stop() {
-	kam.stopOnce.Do(func() {
-		close(kam.stopChan)
-	})
-}
-
-// sendKeepAlive writes an SSE comment line as a keep-alive signal
-func (kam *KeepAliveManager) sendKeepAlive() error {
-	kam.mu.Lock()
-	defer kam.mu.Unlock()
-
-	// Write SSE comment line
-	if _, err := fmt.Fprintf(kam.writer, ": keep-alive\n\n"); err != nil {
-		return fmt.Errorf("failed to write keep-alive signal: %v", err)
-	}
-
-	// Flush to ensure the signal is sent immediately
-	kam.flusher.Flush()
-
-	return nil
 }
 
 // HandleChatCompletions handles OpenAI-compatible chat completions endpoint
@@ -551,7 +487,6 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 	// Use the same responseID that was used for heartbeats
 
 	// Extract choices from the complete response
-	// Note: choices might be []map[string]interface{} or []interface{}, handle both
 	var choices []map[string]interface{}
 	if choicesRaw, ok := openaiResponse["choices"].([]map[string]interface{}); ok {
 		choices = choicesRaw
@@ -606,9 +541,6 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 	flusher.Flush()
 }
 
-// WIJZIGING IN openai.go - vervang handleStreamingChatCompletion functie
-// Dit vermindert de buffering overhead voor snellere streaming
-
 func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -656,18 +588,21 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 	responseID := "chatcmpl-" + uuid.New().String()
 	log.Printf("Starting streaming response: %s", responseID)
 
-	// Buffer voor tekst chunks
+	// Tracking state for multi-part tool calls
 	var textBuffer strings.Builder
 	textBuffer.Grow(2048)
 
+	toolCallsBuffer := make(map[int]map[string]interface{}) // index -> tool call data
+	hasToolCalls := false
 	lastFlush := time.Now()
+
 	const (
 		maxBufferTime = 20 * time.Millisecond
 		maxBufferSize = 2048
 	)
 
-	// Helper functie om tekst buffer te flushen
-	flushBuffer := func() {
+	// Helper to flush text buffer
+	flushTextBuffer := func() {
 		if textBuffer.Len() == 0 {
 			return
 		}
@@ -696,19 +631,58 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 		lastFlush = time.Now()
 	}
 
-	for chunk := range streamChan {
-		// DEBUG LOG: Hiermee zie je eindelijk wat Gemini terugstuurt
-		if config.IsDebugEnabled() {
-			log.Printf("[DEBUG] Raw Stream Chunk: %s", chunk)
+	// Helper to flush tool calls
+	flushToolCalls := func() {
+		if len(toolCallsBuffer) == 0 {
+			return
 		}
 
+		// Convert buffer to array
+		toolCalls := make([]map[string]interface{}, 0, len(toolCallsBuffer))
+		for i := 0; i < len(toolCallsBuffer); i++ {
+			if tc, ok := toolCallsBuffer[i]; ok {
+				toolCalls = append(toolCalls, tc)
+			}
+		}
+
+		if len(toolCalls) == 0 {
+			return
+		}
+
+		chunk := map[string]interface{}{
+			"id":      responseID,
+			"object":  "chat.completion.chunk",
+			"created": time.Now().Unix(),
+			"model":   request.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": toolCalls,
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+
+		jsonData, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+		flusher.Flush()
+
+		// Clear buffer
+		toolCallsBuffer = make(map[int]map[string]interface{})
+	}
+
+	for chunk := range streamChan {
 		var geminiChunk map[string]interface{}
 		if err := json.Unmarshal([]byte(chunk), &geminiChunk); err != nil {
 			continue
 		}
 
+		// Handle errors
 		if errObj, ok := geminiChunk["error"]; ok {
-			flushBuffer()
+			flushTextBuffer()
+			flushToolCalls()
 			errorData := map[string]interface{}{"error": errObj}
 			jsonData, _ := json.Marshal(errorData)
 			fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
@@ -727,64 +701,52 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			for _, part := range parts {
 				partMap, _ := part.(map[string]interface{})
 
-				// 1. Check voor Function Call
-				// Gemini stuurt dit soms als "functionCall" (camelCase)
+				// Handle function calls
 				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
-					flushBuffer() // Eerst tekst wegwerken
+					// Flush any pending text first
+					flushTextBuffer()
+					hasToolCalls = true
 
 					name, _ := fnCall["name"].(string)
 					args, _ := fnCall["args"].(map[string]interface{})
 					argsBytes, _ := json.Marshal(args)
 
-					toolChunk := map[string]interface{}{
-						"id":      responseID,
-						"object":  "chat.completion.chunk",
-						"created": time.Now().Unix(),
-						"model":   request.Model,
-						"choices": []map[string]interface{}{
-							{
-								"index": 0,
-								"delta": map[string]interface{}{
-									"tool_calls": []map[string]interface{}{
-										{
-											"index": 0,
-											"id":    "call_" + uuid.New().String(),
-											"type":  "function",
-											"function": map[string]interface{}{
-												"name":      name,
-												"arguments": string(argsBytes),
-											},
-										},
-									},
-								},
-								"finish_reason": nil,
-							},
+					// Add to tool calls buffer
+					toolCallIndex := len(toolCallsBuffer)
+					toolCallsBuffer[toolCallIndex] = map[string]interface{}{
+						"index": toolCallIndex,
+						"id":    "call_" + uuid.New().String(),
+						"type":  "function",
+						"function": map[string]interface{}{
+							"name":      name,
+							"arguments": string(argsBytes),
 						},
 					}
-					jsonData, _ := json.Marshal(toolChunk)
-					fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-					flusher.Flush()
 					continue
 				}
 
-				// 2. Check voor normale tekst
+				// Handle text
 				if text, ok := partMap["text"].(string); ok {
+					// Skip thinking tokens in streaming (they come separate)
 					if thought, _ := partMap["thought"].(bool); !thought {
 						textBuffer.WriteString(text)
 					}
 				}
 			}
 
+			// Handle finish reason
 			if finishReason, ok := candMap["finishReason"].(string); ok && finishReason != "" {
 				hasFinish = true
-				flushBuffer()
 
-				finalFinishReason := transformers.MapFinishReason(finishReason)
+				// Flush pending content
+				flushTextBuffer()
+				flushToolCalls()
 
-				// Als er tool calls zijn geweest in dit bericht, is de finish reason vaak tool_calls
-				// Maar in streaming moeten we oppassen. Als Gemini "STOP" stuurt na een tool call,
-				// kan de client "tool_calls" verwachten.
-				// Voor nu mappen we de standaard Gemini reasons.
+				// Map finish reason
+				mappedFinishReason := transformers.MapFinishReason(finishReason)
+				if hasToolCalls {
+					mappedFinishReason = "tool_calls"
+				}
 
 				finishChunk := map[string]interface{}{
 					"id":      responseID,
@@ -795,7 +757,7 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 						{
 							"index":         0,
 							"delta":         map[string]interface{}{},
-							"finish_reason": finalFinishReason,
+							"finish_reason": mappedFinishReason,
 						},
 					},
 				}
@@ -805,12 +767,21 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			}
 		}
 
+		// Flush text if needed
 		if !hasFinish && (time.Since(lastFlush) >= maxBufferTime || textBuffer.Len() >= maxBufferSize) {
-			flushBuffer()
+			flushTextBuffer()
+		}
+
+		// Flush tool calls immediately after collection
+		if !hasFinish && len(toolCallsBuffer) > 0 {
+			flushToolCalls()
 		}
 	}
 
-	flushBuffer() // Final flush
+	// Final flushes
+	flushTextBuffer()
+	flushToolCalls()
+
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	log.Printf("Completed streaming response: %s", responseID)
