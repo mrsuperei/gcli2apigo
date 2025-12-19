@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -588,12 +589,15 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 	responseID := "chatcmpl-" + uuid.New().String()
 	log.Printf("Starting streaming response: %s", responseID)
 
-	// Tracking state for multi-part tool calls
+	// State tracking - zoals CLIProxyAPI-Extended
 	var textBuffer strings.Builder
 	textBuffer.Grow(2048)
 
-	toolCallsBuffer := make(map[int]map[string]interface{}) // index -> tool call data
+	// Tool call accumulator: index -> accumulated data
+	toolCallAccumulator := make(map[int]*ToolCallAccumulator)
 	hasToolCalls := false
+	toolCallsFlushed := false // Track if we already flushed tool calls
+	finishReasonSent := false // Track if we already sent finish_reason
 	lastFlush := time.Now()
 
 	const (
@@ -601,7 +605,7 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 		maxBufferSize = 2048
 	)
 
-	// Helper to flush text buffer
+	// Helper to flush text
 	flushTextBuffer := func() {
 		if textBuffer.Len() == 0 {
 			return
@@ -631,18 +635,35 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 		lastFlush = time.Now()
 	}
 
-	// Helper to flush tool calls
+	// Helper to flush accumulated tool calls
 	flushToolCalls := func() {
-		if len(toolCallsBuffer) == 0 {
-			return
+		if len(toolCallAccumulator) == 0 || toolCallsFlushed {
+			return // Skip if empty or already flushed
 		}
 
-		// Convert buffer to array
-		toolCalls := make([]map[string]interface{}, 0, len(toolCallsBuffer))
-		for i := 0; i < len(toolCallsBuffer); i++ {
-			if tc, ok := toolCallsBuffer[i]; ok {
-				toolCalls = append(toolCalls, tc)
+		// Convert to sorted list by index
+		indices := make([]int, 0, len(toolCallAccumulator))
+		for idx := range toolCallAccumulator {
+			indices = append(indices, idx)
+		}
+		sort.Ints(indices)
+
+		toolCalls := make([]map[string]interface{}, 0, len(indices))
+		for _, idx := range indices {
+			acc := toolCallAccumulator[idx]
+			if acc.Name == "" {
+				continue // Skip incomplete tool calls
 			}
+
+			toolCalls = append(toolCalls, map[string]interface{}{
+				"index": idx,
+				"id":    acc.ID,
+				"type":  "function",
+				"function": map[string]interface{}{
+					"name":      acc.Name,
+					"arguments": acc.Arguments,
+				},
+			})
 		}
 
 		if len(toolCalls) == 0 {
@@ -669,10 +690,18 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
 		flusher.Flush()
 
-		// Clear buffer
-		toolCallsBuffer = make(map[int]map[string]interface{})
+		toolCallsFlushed = true // Mark as flushed
+
+		if config.IsDebugEnabled() {
+			log.Printf("[DEBUG] Flushed %d tool call(s) (will not flush again)", len(toolCalls))
+			for _, tc := range toolCalls {
+				fn := tc["function"].(map[string]interface{})
+				log.Printf("[DEBUG]   - %s: %s", fn["name"], fn["arguments"])
+			}
+		}
 	}
 
+	// Process streaming chunks
 	for chunk := range streamChan {
 		var geminiChunk map[string]interface{}
 		if err := json.Unmarshal([]byte(chunk), &geminiChunk); err != nil {
@@ -698,36 +727,55 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			content, _ := candMap["content"].(map[string]interface{})
 			parts, _ := content["parts"].([]interface{})
 
+			candidateIndex := 0
+			if idx, ok := candMap["index"].(float64); ok {
+				candidateIndex = int(idx)
+			}
+
 			for _, part := range parts {
 				partMap, _ := part.(map[string]interface{})
 
-				// Handle function calls
+				// Handle function calls - accumulate per index
 				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
-					// Flush any pending text first
-					flushTextBuffer()
+					flushTextBuffer() // Flush text before tool calls
 					hasToolCalls = true
 
 					name, _ := fnCall["name"].(string)
 					args, _ := fnCall["args"].(map[string]interface{})
-					argsBytes, _ := json.Marshal(args)
+					argsJSON, _ := json.Marshal(args)
 
-					// Add to tool calls buffer
-					toolCallIndex := len(toolCallsBuffer)
-					toolCallsBuffer[toolCallIndex] = map[string]interface{}{
-						"index": toolCallIndex,
-						"id":    "call_" + uuid.New().String(),
-						"type":  "function",
-						"function": map[string]interface{}{
-							"name":      name,
-							"arguments": string(argsBytes),
-						},
+					// Get or create accumulator for this index
+					if _, exists := toolCallAccumulator[candidateIndex]; !exists {
+						toolCallAccumulator[candidateIndex] = &ToolCallAccumulator{
+							Index: candidateIndex,
+							ID:    "call_" + uuid.New().String(),
+						}
+					}
+
+					acc := toolCallAccumulator[candidateIndex]
+
+					// Set name (should be consistent across chunks)
+					if acc.Name == "" {
+						acc.Name = name
+					} else if acc.Name != name {
+						// Name changed - this shouldn't happen but log it
+						if config.IsDebugEnabled() {
+							log.Printf("[WARN] Tool call name changed from %s to %s at index %d", acc.Name, name, candidateIndex)
+						}
+					}
+
+					// Accumulate arguments (replace, don't append)
+					acc.Arguments = string(argsJSON)
+
+					if config.IsDebugEnabled() {
+						log.Printf("[DEBUG] Accumulated tool call chunk: index=%d, name=%s, args_len=%d",
+							candidateIndex, name, len(acc.Arguments))
 					}
 					continue
 				}
 
 				// Handle text
 				if text, ok := partMap["text"].(string); ok {
-					// Skip thinking tokens in streaming (they come separate)
 					if thought, _ := partMap["thought"].(bool); !thought {
 						textBuffer.WriteString(text)
 					}
@@ -735,14 +783,17 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 			}
 
 			// Handle finish reason
-			if finishReason, ok := candMap["finishReason"].(string); ok && finishReason != "" {
+			if finishReason, ok := candMap["finishReason"].(string); ok && finishReason != "" && !finishReasonSent {
 				hasFinish = true
+				finishReasonSent = true // Mark as sent to prevent duplicates
 
-				// Flush pending content
 				flushTextBuffer()
-				flushToolCalls()
 
-				// Map finish reason
+				// Flush tool calls before finish
+				if len(toolCallAccumulator) > 0 {
+					flushToolCalls()
+				}
+
 				mappedFinishReason := transformers.MapFinishReason(finishReason)
 				if hasToolCalls {
 					mappedFinishReason = "tool_calls"
@@ -764,27 +815,39 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 				jsonData, _ := json.Marshal(finishChunk)
 				fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
 				flusher.Flush()
+
+				if config.IsDebugEnabled() {
+					log.Printf("[DEBUG] Sent finish_reason: %s (will not send again)", mappedFinishReason)
+				}
 			}
 		}
 
-		// Flush text if needed
+		// Periodic text flush
 		if !hasFinish && (time.Since(lastFlush) >= maxBufferTime || textBuffer.Len() >= maxBufferSize) {
 			flushTextBuffer()
 		}
-
-		// Flush tool calls immediately after collection
-		if !hasFinish && len(toolCallsBuffer) > 0 {
-			flushToolCalls()
-		}
 	}
 
-	// Final flushes
+	// Final cleanup
 	flushTextBuffer()
-	flushToolCalls()
+	if len(toolCallAccumulator) > 0 {
+		if config.IsDebugEnabled() {
+			log.Printf("[WARN] Flushing remaining tool calls without finish_reason")
+		}
+		flushToolCalls()
+	}
 
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 	log.Printf("Completed streaming response: %s", responseID)
+}
+
+// ToolCallAccumulator accumulates tool call data across multiple chunks
+type ToolCallAccumulator struct {
+	Index     int
+	ID        string
+	Name      string
+	Arguments string
 }
 
 func handleNonStreamingChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {

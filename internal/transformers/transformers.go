@@ -20,6 +20,20 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 	var systemInstruction map[string]interface{}
 	contents := make([]map[string]interface{}, 0)
 
+	// Build tool call ID to name mapping for function responses
+	toolCallMap := make(map[string]string) // tool_call_id -> function_name
+
+	// First pass: collect tool call IDs and names
+	for _, message := range req.Messages {
+		if len(message.ToolCalls) > 0 {
+			for _, tc := range message.ToolCalls {
+				if tc.ID != "" && tc.Function.Name != "" {
+					toolCallMap[tc.ID] = tc.Function.Name
+				}
+			}
+		}
+	}
+
 	// Process messages and separate system instruction
 	for i, message := range req.Messages {
 		role := message.Role
@@ -62,6 +76,30 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 
 		// Handle tool response messages
 		if role == "tool" {
+			// Debug: log tool response details
+			if config.IsDebugEnabled() {
+				log.Printf("[DEBUG] Processing tool response: tool_call_id=%s, name=%s, has_content=%v",
+					message.ToolCallID, message.Name, message.Content != nil)
+			}
+
+			// Get function name from message or tool call map
+			functionName := message.Name
+			if functionName == "" && message.ToolCallID != "" {
+				// Try to get name from tool call ID mapping
+				if name, ok := toolCallMap[message.ToolCallID]; ok {
+					functionName = name
+					if config.IsDebugEnabled() {
+						log.Printf("[DEBUG] Found function name '%s' from tool call ID '%s'", functionName, message.ToolCallID)
+					}
+				}
+			}
+
+			// Skip if we still don't have a function name
+			if functionName == "" {
+				log.Printf("Warning: Skipping tool response without function name (tool_call_id: %s)", message.ToolCallID)
+				continue
+			}
+
 			// Parse tool response content
 			var responseContent interface{}
 			if contentStr, ok := message.Content.(string); ok {
@@ -82,9 +120,9 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 				"parts": []map[string]interface{}{
 					{
 						"functionResponse": map[string]interface{}{
-							"name": message.Name,
+							"name": functionName,
 							"response": map[string]interface{}{
-								"name":    message.Name,
+								"name":    functionName,
 								"content": responseContent,
 							},
 						},
@@ -313,6 +351,12 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 				}
 			}
 		}
+	}
+
+	// Debug log the final request payload
+	if config.IsDebugEnabled() {
+		payloadJSON, _ := json.MarshalIndent(requestPayload, "", "  ")
+		log.Printf("[DEBUG] Gemini CLI API Request Payload:\n%s", string(payloadJSON))
 	}
 
 	return requestPayload
