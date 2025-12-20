@@ -414,59 +414,54 @@ func handleStreamingResponse(resp *http.Response) (chan string, error) {
 		defer close(streamChan)
 		defer resp.Body.Close()
 
-		// Use line reader instead of scanner to avoid buffer limit issues
+		// Stream line by line from Gemini API
 		reader := bufio.NewReader(resp.Body)
-		lineCount := 0
+		chunksSent := 0
 
 		for {
 			line, err := reader.ReadString('\n')
-			if err != nil && err != io.EOF {
-				log.Printf("[ERROR] Error reading stream: %v", err)
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("[ERROR] Error reading stream: %v", err)
+				} else {
+					log.Printf("[DEBUG] Stream EOF reached after %d chunks", chunksSent)
+				}
 				break
 			}
 
-			lineCount++
 			line = strings.TrimSpace(line)
 			if line == "" {
-				if err == io.EOF {
-					if lineCount > 0 {
-						log.Printf("[DEBUG] Stream ended normally after %d lines", lineCount)
-					}
-					break
-				}
 				continue
 			}
 
 			// Use CutPrefix to avoid double prefix check and allocation
 			if chunk, found := strings.CutPrefix(line, "data: "); found {
 				if chunk == "[DONE]" {
-					if lineCount > 0 {
-						log.Printf("[DEBUG] Received [DONE] marker at line %d", lineCount)
-					}
+					log.Printf("[DEBUG] Received [DONE] marker after sending %d chunks", chunksSent)
 					break
 				}
 
 				var obj map[string]any
 				if err := json.Unmarshal([]byte(chunk), &obj); err != nil {
-					log.Printf("[WARN] Failed to parse chunk at line %d: %v (chunk size: %d)", lineCount, err, len(chunk))
+					log.Printf("[WARN] Failed to parse chunk: %v (size: %d)", err, len(chunk))
 					continue
 				}
 
+				// Extract response object if present, otherwise send raw chunk
 				if response, ok := obj["response"].(map[string]any); ok {
 					responseJSON, _ := json.Marshal(response)
 					streamChan <- string(responseJSON)
 				} else {
 					streamChan <- chunk
 				}
-			}
 
-			if err == io.EOF {
-				if lineCount > 0 {
-					log.Printf("[DEBUG] Stream ended at line %d", lineCount)
+				chunksSent++
+				if chunksSent%10 == 0 {
+					log.Printf("[DEBUG] Sent %d chunks to handler", chunksSent)
 				}
-				break
 			}
 		}
+		log.Printf("[DEBUG] Stream complete: sent %d chunks total", chunksSent)
 	}()
 
 	return streamChan, nil

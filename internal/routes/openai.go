@@ -690,6 +690,17 @@ func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, reque
 	log.Printf("[DEBUG] Phase 1 complete: Received %d chunks, accumulated %d text + %d reasoning + %d tool calls",
 		chunkCount, accumulatedText.Len(), accumulatedReasoning.Len(), len(toolCallAccumulator))
 
+	// Show sample of accumulated text for debugging
+	if accumulatedText.Len() > 0 {
+		textSample := accumulatedText.String()
+		if len(textSample) > 200 {
+			log.Printf("[DEBUG] Text sample (first 200 chars): %.200s", textSample)
+			log.Printf("[DEBUG] Text sample (last 200 chars): ...%.200s", textSample[len(textSample)-200:])
+		} else {
+			log.Printf("[DEBUG] Full accumulated text: %s", textSample)
+		}
+	}
+
 	// Phase 2: Stream accumulated content to client
 	log.Printf("[DEBUG] Phase 2: Streaming accumulated content to client...")
 
