@@ -414,18 +414,41 @@ func handleStreamingResponse(resp *http.Response) (chan string, error) {
 		defer close(streamChan)
 		defer resp.Body.Close()
 
-		// Use larger buffer for scanner to handle large chunks
-		scanner := bufio.NewScanner(resp.Body)
-		buf := make([]byte, 64*1024)
-		scanner.Buffer(buf, 256*1024)
+		// Use line reader instead of scanner to avoid buffer limit issues
+		reader := bufio.NewReader(resp.Body)
+		lineCount := 0
 
-		for scanner.Scan() {
-			line := scanner.Text()
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil && err != io.EOF {
+				log.Printf("[ERROR] Error reading stream: %v", err)
+				break
+			}
+
+			lineCount++
+			line = strings.TrimSpace(line)
+			if line == "" {
+				if err == io.EOF {
+					if lineCount > 0 {
+						log.Printf("[DEBUG] Stream ended normally after %d lines", lineCount)
+					}
+					break
+				}
+				continue
+			}
+
 			// Use CutPrefix to avoid double prefix check and allocation
 			if chunk, found := strings.CutPrefix(line, "data: "); found {
+				if chunk == "[DONE]" {
+					if lineCount > 0 {
+						log.Printf("[DEBUG] Received [DONE] marker at line %d", lineCount)
+					}
+					break
+				}
 
 				var obj map[string]any
 				if err := json.Unmarshal([]byte(chunk), &obj); err != nil {
+					log.Printf("[WARN] Failed to parse chunk at line %d: %v (chunk size: %d)", lineCount, err, len(chunk))
 					continue
 				}
 
@@ -435,6 +458,13 @@ func handleStreamingResponse(resp *http.Response) (chan string, error) {
 				} else {
 					streamChan <- chunk
 				}
+			}
+
+			if err == io.EOF {
+				if lineCount > 0 {
+					log.Printf("[DEBUG] Stream ended at line %d", lineCount)
+				}
+				break
 			}
 		}
 	}()
