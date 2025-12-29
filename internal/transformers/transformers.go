@@ -14,8 +14,30 @@ import (
 	"github.com/google/uuid"
 )
 
+// ReasoningEffortToThinkingBudget maps OpenAI reasoning_effort to Gemini thinking budget
+// low: 1024, medium: 4096, high: 8192
+func ReasoningEffortToThinkingBudget(effort string) int {
+	switch strings.ToLower(effort) {
+	case "low":
+		return 1024
+	case "medium":
+		return 4096
+	case "high":
+		return 8192
+	default:
+		return -1 // Gemini default
+	}
+}
+
 // OpenAIRequestToGemini transforms an OpenAI chat completion request to Gemini format
+// Now with full reasoning/thinking support
 func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]interface{} {
+	log.Printf("[DEBUG] ═══════════════════════════════════════════")
+	log.Printf("[DEBUG] OpenAIRequestToGemini CALLED")
+	log.Printf("[DEBUG] Model: %s", req.Model)
+	log.Printf("[DEBUG] ReasoningEffort field: '%s'", req.ReasoningEffort)
+	log.Printf("[DEBUG] ═══════════════════════════════════════════")
+
 	// Extract system instruction from messages (Gemini CLI API format)
 	var systemInstruction map[string]interface{}
 	contents := make([]map[string]interface{}, 0)
@@ -273,10 +295,96 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 		generationConfig["seed"] = *req.Seed
 	}
 
-	// Response format (JSON mode)
+	// ===== REASONING/THINKING SUPPORT =====
+	// Support: reasoning_effort (string), thinking_tokens (int), thinking_enabled (bool)
+	var thinkingBudget int
+
+	log.Printf("[DEBUG] ════════ REASONING EFFORT CHECK START ════════")
+	log.Printf("[DEBUG] req.ReasoningEffort = '%s' (empty: %v)", req.ReasoningEffort, req.ReasoningEffort == "")
+	log.Printf("[DEBUG] req.ThinkingTokens = %v", req.ThinkingTokens)
+	log.Printf("[DEBUG] req.ThinkingEnabled = %v", req.ThinkingEnabled)
+
+	// PRIORITY 1: Direct token count (thinking_tokens)
+	if req.ThinkingTokens != nil && *req.ThinkingTokens > 0 {
+		thinkingBudget = *req.ThinkingTokens
+		log.Printf("[DEBUG] ✅ Using direct thinking_tokens: %d", thinkingBudget)
+	} else if req.ThinkingEnabled != nil && *req.ThinkingEnabled {
+		// PRIORITY 2: Boolean flag (thinking_enabled) - use default budget
+		thinkingBudget = 4096 // Default medium budget
+		log.Printf("[DEBUG] ✅ Using thinking_enabled flag → default budget: %d", thinkingBudget)
+	} else if req.ReasoningEffort != "" {
+		// PRIORITY 3: Reasoning effort (low/medium/high)
+		thinkingBudget = ReasoningEffortToThinkingBudget(req.ReasoningEffort)
+		log.Printf("[DEBUG] ✅ Using reasoning_effort '%s' → %d tokens", req.ReasoningEffort, thinkingBudget)
+	} else if req.ResponseFormat != nil {
+		// PRIORITY 4: Fallback to response_format (deprecated)
+		if effort, ok := req.ResponseFormat["reasoning_effort"].(string); ok {
+			thinkingBudget = ReasoningEffortToThinkingBudget(effort)
+			log.Printf("[DEBUG] ⚠️  Using reasoning_effort from response_format (deprecated): '%s' → %d tokens", effort, thinkingBudget)
+		} else if tokens, ok := req.ResponseFormat["thinking_tokens"].(float64); ok {
+			thinkingBudget = int(tokens)
+			log.Printf("[DEBUG] ⚠️  Using thinking_tokens from response_format (deprecated): %d", thinkingBudget)
+		} else if enabled, ok := req.ResponseFormat["thinking_enabled"].(bool); ok && enabled {
+			thinkingBudget = 4096
+			log.Printf("[DEBUG] ⚠️  Using thinking_enabled from response_format (deprecated): %d", thinkingBudget)
+		}
+	}
+
+	log.Printf("[DEBUG] Final thinkingBudget: %d", thinkingBudget)
+
+	// HELIXRUN COMPATIBILITY: Check nested generation_config
+	// Helixrun sends: {"generation_config": {"thinking_enabled": true}}
+	// We need to check this BEFORE applying thinking budget
+	if thinkingBudget == 0 && req.ResponseFormat != nil {
+		if genCfg, ok := req.ResponseFormat["generation_config"].(map[string]interface{}); ok {
+			log.Printf("[DEBUG] 🔧 Found nested generation_config (helixrun style): %+v", genCfg)
+
+			// Check thinking_enabled in nested config
+			if enabled, ok := genCfg["thinking_enabled"].(bool); ok && enabled {
+				thinkingBudget = 4096 // Default medium budget
+				log.Printf("[DEBUG] ✅ Using thinking_enabled from nested generation_config → %d", thinkingBudget)
+			}
+
+			// Check thinking_tokens in nested config
+			if tokens, ok := genCfg["thinking_tokens"].(float64); ok && tokens > 0 {
+				thinkingBudget = int(tokens)
+				log.Printf("[DEBUG] ✅ Using thinking_tokens from nested generation_config → %d", thinkingBudget)
+			}
+		}
+	}
+
+	// Apply thinking budget if set
+	if thinkingBudget > 0 {
+		log.Printf("[DEBUG] Setting up thinking config...")
+
+		// ✅ CORRECT: includeThoughts BINNEN thinkingConfig!
+		generationConfig["thinkingConfig"] = map[string]interface{}{
+			"thinkingBudget":  thinkingBudget,
+			"includeThoughts": true, // ← BINNEN thinkingConfig!
+		}
+
+		log.Printf("[DEBUG] ✅ Set thinkingBudget=%d, includeThoughts=true", thinkingBudget)
+		log.Printf("[DEBUG] generationConfig now: %+v", generationConfig)
+	} else {
+		log.Printf("[DEBUG] ⚠️  No thinking enabled (budget=0)")
+	}
+
+	log.Printf("[DEBUG] ════════ REASONING EFFORT CHECK END ════════")
+	log.Printf("[DEBUG] Final generationConfig: %+v", generationConfig)
+
+	// Handle JSON mode
 	if req.ResponseFormat != nil {
 		if respType, ok := req.ResponseFormat["type"].(string); ok && respType == "json_object" {
 			generationConfig["responseMimeType"] = "application/json"
+
+			// Handle JSON schema if provided
+			if schema, ok := req.ResponseFormat["json_schema"].(map[string]interface{}); ok {
+				// Gemini expects the schema in a specific format
+				if schemaObj, ok := schema["schema"].(map[string]interface{}); ok {
+					generationConfig["responseSchema"] = schemaObj
+					log.Printf("[DEBUG] Added JSON schema for structured output")
+				}
+			}
 		}
 	}
 
@@ -363,6 +471,7 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 }
 
 // GeminiResponseToOpenAI transforms a Gemini API response to OpenAI chat completion format
+// Now with enhanced reasoning content handling
 func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map[string]interface{} {
 	choices := make([]map[string]interface{}, 0)
 
@@ -437,7 +546,7 @@ func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map
 			}
 		}
 
-		// Add reasoning content
+		// Add reasoning content (OpenAI format)
 		if reasoningContent != "" {
 			message["reasoning_content"] = reasoningContent
 		}

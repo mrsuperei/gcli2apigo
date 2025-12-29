@@ -8,7 +8,6 @@ import (
 	"log"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"gcli2apigo/internal/auth"
@@ -20,199 +19,15 @@ import (
 	"github.com/google/uuid"
 )
 
-// ChunkAccumulator accumulates streaming chunks with size checking
-type ChunkAccumulator struct {
-	chunks      []map[string]interface{}
-	mu          sync.Mutex
-	maxSize     int64
-	currentSize int64
-}
-
-// NewChunkAccumulator creates a new ChunkAccumulator with the specified max size
-func NewChunkAccumulator(maxSize int64) *ChunkAccumulator {
-	return &ChunkAccumulator{
-		chunks:      make([]map[string]interface{}, 0),
-		maxSize:     maxSize,
-		currentSize: 0,
-	}
-}
-
-// Add adds a chunk to the accumulator with size checking
-func (ca *ChunkAccumulator) Add(chunk map[string]interface{}) error {
-	ca.mu.Lock()
-	defer ca.mu.Unlock()
-
-	// Estimate chunk size by marshaling to JSON
-	chunkBytes, err := json.Marshal(chunk)
-	if err != nil {
-		return fmt.Errorf("failed to marshal chunk: %v", err)
-	}
-
-	chunkSize := int64(len(chunkBytes))
-
-	// Check if adding this chunk would exceed the size limit
-	if ca.currentSize+chunkSize > ca.maxSize {
-		return fmt.Errorf("accumulated size would exceed limit: current=%d bytes, chunk=%d bytes, limit=%d bytes",
-			ca.currentSize, chunkSize, ca.maxSize)
-	}
-
-	ca.chunks = append(ca.chunks, chunk)
-	ca.currentSize += chunkSize
-
-	return nil
-}
-
-// GetComplete merges all accumulated chunks into a complete response
-func (ca *ChunkAccumulator) GetComplete() map[string]interface{} {
-	ca.mu.Lock()
-	defer ca.mu.Unlock()
-
-	if len(ca.chunks) == 0 {
-		return nil
-	}
-
-	return ca.mergeChunks()
-}
-
-// Size returns the current accumulated size in bytes
-func (ca *ChunkAccumulator) Size() int64 {
-	ca.mu.Lock()
-	defer ca.mu.Unlock()
-	return ca.currentSize
-}
-
-// mergeChunks merges all accumulated chunks into a single response
-func (ca *ChunkAccumulator) mergeChunks() map[string]interface{} {
-	if len(ca.chunks) == 0 {
-		return nil
-	}
-
-	// Start with the first chunk as the base
-	merged := make(map[string]interface{})
-
-	// Copy top-level fields from the first chunk
-	firstChunk := ca.chunks[0]
-	for key, value := range firstChunk {
-		merged[key] = value
-	}
-
-	// Merge all candidates from all chunks
-	allCandidates := make([]map[string]interface{}, 0)
-
-	for _, chunk := range ca.chunks {
-		if candidates, ok := chunk["candidates"].([]interface{}); ok {
-			for _, candidate := range candidates {
-				if candMap, ok := candidate.(map[string]interface{}); ok {
-					allCandidates = append(allCandidates, candMap)
-				}
-			}
-		}
-	}
-
-	// Group candidates by index and merge their content
-	candidatesByIndex := make(map[int][]map[string]interface{})
-
-	for _, candidate := range allCandidates {
-		index := 0
-		if idx, ok := candidate["index"].(float64); ok {
-			index = int(idx)
-		}
-		candidatesByIndex[index] = append(candidatesByIndex[index], candidate)
-	}
-
-	// Merge each candidate group
-	mergedCandidates := make([]interface{}, 0)
-
-	for index := 0; index < len(candidatesByIndex); index++ {
-		candidates := candidatesByIndex[index]
-		if len(candidates) == 0 {
-			continue
-		}
-
-		// Merge content parts from all chunks for this candidate
-		var contentParts []interface{}
-		var reasoningParts []string
-		var finalFinishReason string
-
-		for _, candidate := range candidates {
-			// Extract content parts
-			if content, ok := candidate["content"].(map[string]interface{}); ok {
-				if parts, ok := content["parts"].([]interface{}); ok {
-					for _, part := range parts {
-						if partMap, ok := part.(map[string]interface{}); ok {
-							// Check if this is a thinking token
-							if thought, ok := partMap["thought"].(bool); ok && thought {
-								if text, ok := partMap["text"].(string); ok {
-									reasoningParts = append(reasoningParts, text)
-								}
-							} else {
-								// Regular content part
-								contentParts = append(contentParts, part)
-							}
-						}
-					}
-				}
-			}
-
-			// Use the last non-empty finish reason
-			if finishReason, ok := candidate["finishReason"].(string); ok && finishReason != "" {
-				finalFinishReason = finishReason
-			}
-		}
-
-		// Build merged candidate
-		mergedCandidate := map[string]interface{}{
-			"index": index,
-			"content": map[string]interface{}{
-				"role":  "model",
-				"parts": contentParts,
-			},
-		}
-
-		// Add reasoning parts if present
-		if len(reasoningParts) > 0 {
-			// Add reasoning as a separate part with thought flag
-			reasoningText := strings.Join(reasoningParts, "")
-			if reasoningText != "" {
-				// Add to content parts with thought flag
-				existingParts := mergedCandidate["content"].(map[string]interface{})["parts"].([]interface{})
-				reasoningPart := map[string]interface{}{
-					"text":    reasoningText,
-					"thought": true,
-				}
-				existingParts = append(existingParts, reasoningPart)
-				mergedCandidate["content"].(map[string]interface{})["parts"] = existingParts
-			}
-		}
-
-		// Add finish reason if present
-		if finalFinishReason != "" {
-			mergedCandidate["finishReason"] = finalFinishReason
-		}
-
-		mergedCandidates = append(mergedCandidates, mergedCandidate)
-	}
-
-	// Set the merged candidates
-	merged["candidates"] = mergedCandidates
-
-	return merged
-}
-
 // isFakeStreamingAllowed checks if a model supports fake streaming
-// Only gemini-2.5-pro (and its preview models) and gemini flash models (excluding gemini-flash-image) are allowed
 func isFakeStreamingAllowed(modelName string) bool {
-	// Remove "models/" prefix if present
 	modelName = strings.TrimPrefix(modelName, "models/")
 
-	// Allow gemini-2.5-pro and its preview models
 	if strings.HasPrefix(modelName, "gemini-2.5-pro") {
 		return true
 	}
 
-	// Allow gemini flash models, but exclude gemini-flash-image models
 	if strings.Contains(modelName, "gemini-flash") || strings.Contains(modelName, "gemini-2.5-flash") {
-		// Exclude gemini-flash-image models
 		if strings.Contains(modelName, "flash-image") {
 			return false
 		}
@@ -224,7 +39,6 @@ func isFakeStreamingAllowed(modelName string) bool {
 
 // HandleChatCompletions handles OpenAI-compatible chat completions endpoint
 func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	// Authenticate user
 	if _, err := auth.AuthenticateUser(r); err != nil {
 		http.Error(w, `{"error":{"message":"Invalid authentication credentials","type":"invalid_request_error","code":401}}`, http.StatusUnauthorized)
 		return
@@ -235,7 +49,6 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse request
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, `{"error":{"message":"Failed to read request body","type":"invalid_request_error","code":400}}`, http.StatusBadRequest)
@@ -248,31 +61,69 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("OpenAI chat completion request: model=%s, stream=%v", request.Model, request.Stream)
+	// DEBUG: Log volledige request
+	log.Printf("═══════════════════════════════════════════════════")
+	log.Printf("📥 INCOMING REQUEST")
+	log.Printf("Model: %s", request.Model)
+	log.Printf("Stream: %v", request.Stream)
 
-	// Detect and handle fake stream mode based on language setting
+	// Check BOTH locations for reasoning_effort
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("🧠 REASONING/THINKING CHECK:")
+
+	// Check thinking_tokens (direct token count)
+	if request.ThinkingTokens != nil {
+		log.Printf("  ✅ thinking_tokens: %d", *request.ThinkingTokens)
+	} else {
+		log.Printf("  ❌ thinking_tokens: not set")
+	}
+
+	// Check reasoning_effort (low/medium/high)
+	if request.ReasoningEffort != "" {
+		log.Printf("  ✅ reasoning_effort: '%s'", request.ReasoningEffort)
+	} else {
+		log.Printf("  ❌ reasoning_effort: not set")
+	}
+
+	// Check response_format fallbacks
+	if request.ResponseFormat != nil {
+		if effort, ok := request.ResponseFormat["reasoning_effort"].(string); ok {
+			log.Printf("  ⚠️  response_format.reasoning_effort: '%s' (deprecated)", effort)
+		}
+		if tokens, ok := request.ResponseFormat["thinking_tokens"].(float64); ok {
+			log.Printf("  ⚠️  response_format.thinking_tokens: %d (deprecated)", int(tokens))
+		}
+		if len(request.ResponseFormat) > 0 {
+			log.Printf("  Response Format: %+v", request.ResponseFormat)
+		}
+	} else {
+		log.Printf("  Response Format: nil")
+	}
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("═══════════════════════════════════════════════════")
+
+	// Detect fake stream mode - ALLEEN als expliciet gevraagd via model naam
 	modelName := request.Model
 	isFakeStream := false
 
-	// Check for English format: modelID-fake
 	if strings.HasSuffix(modelName, "-fake") {
 		isFakeStream = true
 		modelName = strings.TrimSuffix(modelName, "-fake")
+		log.Printf("🔄 Fake stream mode DETECTED via model suffix: %s", modelName)
 	} else if strings.HasPrefix(modelName, "假流式/") {
-		// Check for Chinese format: 假流式/modelID
 		isFakeStream = true
 		modelName = strings.TrimPrefix(modelName, "假流式/")
+		log.Printf("🔄 Fake stream mode DETECTED via prefix: %s", modelName)
+	} else {
+		log.Printf("✅ Normal mode - NO fake stream detection")
 	}
 
 	if isFakeStream {
 		request.Model = modelName
-		log.Printf("Detected fake stream mode, stripped model name: %s", modelName)
-
-		// Validate that fake streaming is only allowed for specific models
 		if !isFakeStreamingAllowed(modelName) {
 			errorData := map[string]interface{}{
 				"error": map[string]interface{}{
-					"message": fmt.Sprintf("Fake streaming is not supported for model: %s. Only gemini-2.5-pro (and preview models) and gemini flash models (excluding gemini-flash-image) support fake streaming.", modelName),
+					"message": fmt.Sprintf("Fake streaming not supported for model: %s", modelName),
 					"type":    "invalid_request_error",
 					"code":    400,
 				},
@@ -285,24 +136,78 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Transform OpenAI request to Gemini format
+	log.Printf("🔄 Transforming OpenAI → Gemini...")
 	geminiRequestData := transformers.OpenAIRequestToGemini(&request)
 
-	// Build the payload for Google API
-	geminiPayload := client.BuildGeminiPayloadFromOpenAI(geminiRequestData)
+	// ✅ INLINE PAYLOAD BUILDING - Behoud generationConfig!
+	// BuildGeminiPayloadFromOpenAI overschrijft mogelijk de config, dus doen we het inline
+	safetySettings := config.DefaultSafetySettings
+	if ss, ok := geminiRequestData["safetySettings"]; ok && ss != nil {
+		if ssSlice, ok := ss.([]config.SafetySetting); ok {
+			safetySettings = ssSlice
+		}
+	}
+
+	// BELANGRIJK: Haal generationConfig uit transform (bevat thinkingConfig!)
+	generationConfig, hasGenConfig := geminiRequestData["generationConfig"].(map[string]interface{})
+	if !hasGenConfig || generationConfig == nil {
+		generationConfig = make(map[string]interface{})
+		log.Printf("[WARN] No generationConfig from transformer!")
+	}
+
+	log.Printf("[DEBUG] generationConfig from transformer: %+v", generationConfig)
+
+	requestData := map[string]interface{}{
+		"contents":         geminiRequestData["contents"],
+		"safetySettings":   safetySettings,
+		"generationConfig": generationConfig, // ✅ Bevat thinkingConfig!
+	}
+
+	if systemInstruction, ok := geminiRequestData["systemInstruction"]; ok && systemInstruction != nil {
+		requestData["systemInstruction"] = systemInstruction
+	}
+	if cachedContent, ok := geminiRequestData["cachedContent"]; ok && cachedContent != nil {
+		requestData["cachedContent"] = cachedContent
+	}
+	if tools, ok := geminiRequestData["tools"]; ok && tools != nil {
+		requestData["tools"] = tools
+	}
+	if toolConfig, ok := geminiRequestData["toolConfig"]; ok && toolConfig != nil {
+		requestData["toolConfig"] = toolConfig
+	}
+
+	geminiPayload := map[string]interface{}{
+		"model":   geminiRequestData["model"],
+		"request": requestData,
+	}
+
+	// DEBUG: Check wat er in geminiPayload zit
+	if reqData, ok := geminiPayload["request"].(map[string]interface{}); ok {
+		if genConfig, ok := reqData["generationConfig"].(map[string]interface{}); ok {
+			log.Printf("📋 Generation Config: %+v", genConfig)
+			if thinkingConfig, ok := genConfig["thinkingConfig"].(map[string]interface{}); ok {
+				log.Printf("🧠 THINKING CONFIG FOUND: %+v", thinkingConfig)
+			} else {
+				log.Printf("⚠️  NO THINKING CONFIG in generation config")
+			}
+		}
+	}
 
 	// Route to appropriate handler
 	if isFakeStream {
-		// Force fake stream handler regardless of stream parameter
+		log.Printf("📤 Routing to: FAKE STREAM handler")
 		handleFakeStreamChatCompletion(w, r, &request, geminiPayload)
 	} else if request.Stream {
-		handleStreamingChatCompletion(w, r, &request, geminiPayload)
+		log.Printf("📤 Routing to: TRUE LIVE STREAM handler")
+		handleTrueLiveStreamingChatCompletion(w, r, &request, geminiPayload)
 	} else {
+		log.Printf("📤 Routing to: NON-STREAMING handler")
 		handleNonStreamingChatCompletion(w, r, &request, geminiPayload)
 	}
 }
 
-func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
-	// Set SSE headers since we'll return the response as streaming chunks
+// handleTrueLiveStreamingChatCompletion implements TRUE LIVE STREAMING with ZERO buffering
+func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -314,12 +219,279 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		return
 	}
 
-	// Create context with timeout for chunk collection (5 minutes)
-	const collectionTimeout = 5 * time.Minute
-	ctx, cancel := context.WithTimeout(r.Context(), collectionTimeout)
+	log.Printf("🚀 Starting TRUE LIVE STREAMING")
+
+	// Send request to Gemini with streaming enabled
+	result, err := client.SendGeminiRequest(geminiPayload, true)
+	if err != nil {
+		log.Printf("❌ Gemini request failed: %v", err)
+		errorChunk := map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": fmt.Sprintf("Request failed: %v", err),
+				"type":    "api_error",
+				"code":    500,
+			},
+		}
+		jsonData, _ := json.Marshal(errorChunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	streamChan, ok := result.(chan string)
+	if !ok {
+		log.Printf("❌ Invalid stream channel type")
+		errorChunk := map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": "Streaming request failed",
+				"type":    "api_error",
+				"code":    500,
+			},
+		}
+		jsonData, _ := json.Marshal(errorChunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+
+	responseID := "chatcmpl-" + uuid.New().String()
+	createdTime := time.Now().Unix()
+
+	log.Printf("✅ Stream channel received, response ID: %s", responseID)
+
+	// Send initial chunk with role
+	initialChunk := map[string]interface{}{
+		"id":      responseID,
+		"object":  "chat.completion.chunk",
+		"created": createdTime,
+		"model":   request.Model,
+		"choices": []map[string]interface{}{
+			{
+				"index": 0,
+				"delta": map[string]interface{}{
+					"role": "assistant",
+				},
+				"finish_reason": nil,
+			},
+		},
+	}
+	jsonData, _ := json.Marshal(initialChunk)
+	fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+	flusher.Flush()
+	log.Printf("📤 Sent initial chunk with role")
+
+	// Process stream chunks with ZERO buffering
+	chunkCount := 0
+	var lastFinishReason string
+	toolCallsBuffer := make([]map[string]interface{}, 0)
+	toolCallsSent := false
+	reasoningChunks := 0
+	contentChunks := 0
+
+	for geminiChunkStr := range streamChan {
+		chunkCount++
+
+		var geminiChunk map[string]interface{}
+		if err := json.Unmarshal([]byte(geminiChunkStr), &geminiChunk); err != nil {
+			log.Printf("⚠️  Chunk %d: Parse error: %v", chunkCount, err)
+			continue
+		}
+
+		// DEBUG: Log eerste paar chunks
+		if chunkCount <= 3 {
+			log.Printf("📦 Chunk %d received: %s", chunkCount, geminiChunkStr[:min(200, len(geminiChunkStr))])
+		}
+
+		// Check for errors
+		if errObj, ok := geminiChunk["error"]; ok {
+			log.Printf("❌ Error in chunk %d: %+v", chunkCount, errObj)
+			errorChunk := map[string]interface{}{
+				"id":      responseID,
+				"object":  "chat.completion.chunk",
+				"created": createdTime,
+				"model":   request.Model,
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"delta":         map[string]interface{}{},
+						"finish_reason": "error",
+					},
+				},
+				"error": errObj,
+			}
+			jsonData, _ := json.Marshal(errorChunk)
+			fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+			flusher.Flush()
+			break
+		}
+
+		candidates, _ := geminiChunk["candidates"].([]interface{})
+
+		for _, candidate := range candidates {
+			candMap, _ := candidate.(map[string]interface{})
+			content, _ := candMap["content"].(map[string]interface{})
+			parts, _ := content["parts"].([]interface{})
+
+			// Process each part
+			for partIdx, part := range parts {
+				partMap, _ := part.(map[string]interface{})
+
+				// DEBUG: Log part details in eerste chunks
+				if chunkCount <= 3 {
+					log.Printf("  Part %d: %+v", partIdx, partMap)
+				}
+
+				// Handle tool calls - BUFFER them
+				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
+					name, _ := fnCall["name"].(string)
+					args, _ := fnCall["args"].(map[string]interface{})
+					argsJSON, _ := json.Marshal(args)
+
+					toolCall := map[string]interface{}{
+						"index": len(toolCallsBuffer),
+						"id":    "call_" + uuid.New().String(),
+						"type":  "function",
+						"function": map[string]interface{}{
+							"name":      name,
+							"arguments": string(argsJSON),
+						},
+					}
+					toolCallsBuffer = append(toolCallsBuffer, toolCall)
+
+					log.Printf("🔧 Buffered tool call %d: %s", len(toolCallsBuffer), name)
+					continue
+				}
+
+				// Handle text content - IMMEDIATE STREAMING
+				if text, ok := partMap["text"].(string); ok {
+					if text == "" {
+						continue
+					}
+
+					// Check if this is reasoning/thinking content
+					isThought, _ := partMap["thought"].(bool)
+
+					delta := map[string]interface{}{}
+					if isThought {
+						delta["reasoning_content"] = text
+						reasoningChunks++
+						log.Printf("🧠 REASONING chunk %d: %s", reasoningChunks, text[:min(50, len(text))])
+					} else {
+						delta["content"] = text
+						contentChunks++
+						if contentChunks <= 5 {
+							log.Printf("💬 Content chunk %d: %s", contentChunks, text[:min(50, len(text))])
+						}
+					}
+
+					chunk := map[string]interface{}{
+						"id":      responseID,
+						"object":  "chat.completion.chunk",
+						"created": createdTime,
+						"model":   request.Model,
+						"choices": []map[string]interface{}{
+							{
+								"index":         0,
+								"delta":         delta,
+								"finish_reason": nil,
+							},
+						},
+					}
+
+					jsonData, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+					flusher.Flush() // CRITICAL: Flush immediately!
+				}
+			}
+
+			// Handle finish reason
+			if finishReason, ok := candMap["finishReason"].(string); ok && finishReason != "" {
+				lastFinishReason = finishReason
+				log.Printf("🏁 Finish reason detected: %s", finishReason)
+			}
+		}
+	}
+
+	log.Printf("📊 Stream completed:")
+	log.Printf("  - Total chunks: %d", chunkCount)
+	log.Printf("  - Content chunks: %d", contentChunks)
+	log.Printf("  - Reasoning chunks: %d", reasoningChunks)
+	log.Printf("  - Tool calls: %d", len(toolCallsBuffer))
+
+	// Send buffered tool calls if any
+	if len(toolCallsBuffer) > 0 && !toolCallsSent {
+		toolCallChunk := map[string]interface{}{
+			"id":      responseID,
+			"object":  "chat.completion.chunk",
+			"created": createdTime,
+			"model":   request.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": toolCallsBuffer,
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		jsonData, _ := json.Marshal(toolCallChunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+		flusher.Flush()
+		log.Printf("🔧 Sent %d buffered tool calls", len(toolCallsBuffer))
+	}
+
+	// Send finish reason
+	if lastFinishReason != "" {
+		mappedFinishReason := transformers.MapFinishReason(lastFinishReason)
+		if len(toolCallsBuffer) > 0 {
+			mappedFinishReason = "tool_calls"
+		}
+
+		finishChunk := map[string]interface{}{
+			"id":      responseID,
+			"object":  "chat.completion.chunk",
+			"created": createdTime,
+			"model":   request.Model,
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": mappedFinishReason,
+				},
+			},
+		}
+		jsonData, _ := json.Marshal(finishChunk)
+		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+		flusher.Flush()
+		log.Printf("🏁 Sent finish_reason: %v", mappedFinishReason)
+	}
+
+	// Send [DONE]
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+
+	log.Printf("✅ Stream COMPLETE: %s", responseID)
+}
+
+// handleFakeStreamChatCompletion handles fake streaming (buffer then stream complete response)
+func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, `{"error":{"message":"Streaming not supported","type":"api_error","code":500}}`, http.StatusInternalServerError)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Minute)
 	defer cancel()
 
-	// Force streaming mode for internal API request
 	result, err := client.SendGeminiRequest(geminiPayload, true)
 	if err != nil {
 		errorData := map[string]interface{}{
@@ -336,7 +508,6 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		return
 	}
 
-	// Receive streaming channel from client layer
 	streamChan, ok := result.(chan string)
 	if !ok {
 		errorData := map[string]interface{}{
@@ -353,23 +524,16 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		return
 	}
 
-	// Create chunk accumulator with 10 MB limit
-	const maxSize = 10 * 1024 * 1024 // 10 MB
-	accumulator := NewChunkAccumulator(maxSize)
-
-	// Start heartbeat sender to keep connection alive during collection
-	const heartbeatInterval = 3 * time.Second
 	responseID := "chatcmpl-" + uuid.New().String()
+
+	// Heartbeat
 	heartbeatDone := make(chan struct{})
-
 	go func() {
-		ticker := time.NewTicker(heartbeatInterval)
+		ticker := time.NewTicker(3 * time.Second)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-ticker.C:
-				// Send heartbeat chunk with empty content
 				heartbeat := map[string]interface{}{
 					"id":      responseID,
 					"object":  "chat.completion.chunk",
@@ -398,42 +562,22 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 
 	log.Printf("Starting fake stream collection for model: %s", request.Model)
 
-	// Loop through streaming channel and collect chunks
+	// Collect all chunks
+	allChunks := make([]map[string]interface{}, 0)
 	for chunk := range streamChan {
-		// Check for client disconnect or timeout
 		select {
 		case <-ctx.Done():
-			if ctx.Err() == context.DeadlineExceeded {
-				log.Printf("Timeout during fake stream collection after %v, cleaned up resources", collectionTimeout)
-				errorData := map[string]interface{}{
-					"error": map[string]interface{}{
-						"message": fmt.Sprintf("Request timeout: chunk collection exceeded %v", collectionTimeout),
-						"type":    "timeout_error",
-						"code":    504,
-					},
-				}
-				jsonData, _ := json.Marshal(errorData)
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusGatewayTimeout)
-				w.Write(jsonData)
-			} else {
-				log.Printf("Client disconnected during fake stream collection, cleaned up resources")
-			}
 			return
 		default:
 		}
 
 		var geminiChunk map[string]interface{}
 		if err := json.Unmarshal([]byte(chunk), &geminiChunk); err != nil {
-			log.Printf("Failed to unmarshal chunk: %v", err)
 			continue
 		}
 
-		// Check for error chunks and abort if found
 		if errObj, ok := geminiChunk["error"]; ok {
-			errorData := map[string]interface{}{
-				"error": errObj,
-			}
+			errorData := map[string]interface{}{"error": errObj}
 			jsonData, _ := json.Marshal(errorData)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -441,28 +585,11 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 			return
 		}
 
-		// Add chunk to accumulator
-		if err := accumulator.Add(geminiChunk); err != nil {
-			log.Printf("Failed to add chunk to accumulator: %v", err)
-			errorData := map[string]interface{}{
-				"error": map[string]interface{}{
-					"message": fmt.Sprintf("Response too large: %v", err),
-					"type":    "api_error",
-					"code":    413,
-				},
-			}
-			jsonData, _ := json.Marshal(errorData)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			w.Write(jsonData)
-			return
-		}
+		allChunks = append(allChunks, geminiChunk)
 	}
 
-	log.Printf("Completed fake stream collection, accumulated size: %d bytes", accumulator.Size())
-
-	// Get complete response from accumulator
-	completeResponse := accumulator.GetComplete()
+	// Merge chunks
+	completeResponse := mergeGeminiChunks(allChunks)
 	if completeResponse == nil {
 		errorData := map[string]interface{}{
 			"error": map[string]interface{}{
@@ -478,35 +605,22 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		return
 	}
 
-	// Transform to OpenAI non-streaming format first
+	// Transform to OpenAI format
 	openaiResponse := transformers.GeminiResponseToOpenAI(completeResponse, request.Model)
 
-	log.Printf("Successfully processed fake stream response for model: %s", request.Model)
-
-	// Convert the complete response to a single streaming chunk and send via SSE
-	// Use the same responseID that was used for heartbeats
-
-	// Extract choices from the complete response
+	// Extract choices
 	var choices []map[string]interface{}
 	if choicesRaw, ok := openaiResponse["choices"].([]map[string]interface{}); ok {
 		choices = choicesRaw
-	} else if choicesInterface, ok := openaiResponse["choices"].([]interface{}); ok {
-		// Convert []interface{} to []map[string]interface{}
-		for _, c := range choicesInterface {
-			if cMap, ok := c.(map[string]interface{}); ok {
-				choices = append(choices, cMap)
-			}
-		}
 	}
 
-	// Build streaming choices with all content in deltas
+	// Build streaming chunk
 	streamingChoices := make([]map[string]interface{}, 0)
 	for _, choiceMap := range choices {
 		message, _ := choiceMap["message"].(map[string]interface{})
 		index, _ := choiceMap["index"].(int)
 		finishReason := choiceMap["finish_reason"]
 
-		// Build delta from message - this contains ALL the content
 		delta := make(map[string]interface{})
 		if content, ok := message["content"].(string); ok {
 			delta["content"] = content
@@ -522,7 +636,6 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		})
 	}
 
-	// Create a single streaming chunk with all content
 	streamChunk := map[string]interface{}{
 		"id":      responseID,
 		"object":  "chat.completion.chunk",
@@ -531,324 +644,57 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		"choices": streamingChoices,
 	}
 
-	// Send as single SSE event
 	jsonData, _ := json.Marshal(streamChunk)
 	fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
 	flusher.Flush()
 
-	// Send the final [DONE] marker
 	fmt.Fprintf(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }
 
-// handleStreamingChatCompletion handles streaming chat completions with proper tool call support
-// Strategy: Full accumulation from Gemini stream before streaming to client (IR-based approach)
-// Vervang handleStreamingChatCompletion volledig in internal/routes/openai.go
-// Gebaseerd op CLIProxyAPI-Extended: stream text live, buffer tool calls
-func handleStreamingChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, `{"error":{"message":"Streaming not supported","type":"api_error","code":500}}`, http.StatusInternalServerError)
-		return
+func mergeGeminiChunks(chunks []map[string]interface{}) map[string]interface{} {
+	if len(chunks) == 0 {
+		return nil
 	}
 
-	result, err := client.SendGeminiRequest(geminiPayload, true)
-	if err != nil {
-		errorData := map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": fmt.Sprintf("Request failed: %v", err),
-				"type":    "api_error",
-				"code":    500,
-			},
-		}
-		jsonData, _ := json.Marshal(errorData)
-		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
-	}
+	merged := make(map[string]interface{})
+	allParts := make([]interface{}, 0)
+	var lastFinishReason string
 
-	streamChan, ok := result.(chan string)
-	if !ok {
-		errorData := map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": "Streaming request failed",
-				"type":    "api_error",
-				"code":    500,
-			},
-		}
-		jsonData, _ := json.Marshal(errorData)
-		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
-	}
-
-	responseID := "chatcmpl-" + uuid.New().String()
-	log.Printf("Starting streaming response: %s", responseID)
-
-	// State
-	toolCallsMap := make(map[string]*SimpleToolCall) // name -> tool call (buffer, not streamed yet)
-	toolCallsOrder := make([]string, 0)              // Track order
-	hasToolCalls := false
-	sentToolCalls := false
-	sentFinishReason := false
-
-	// Process stream chunks
-	for chunk := range streamChan {
-		var geminiChunk map[string]interface{}
-		if err := json.Unmarshal([]byte(chunk), &geminiChunk); err != nil {
-			continue
-		}
-
-		// Handle errors
-		if errObj, ok := geminiChunk["error"]; ok {
-			errorData := map[string]interface{}{"error": errObj}
-			jsonData, _ := json.Marshal(errorData)
-			fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-			flusher.Flush()
-			return
-		}
-
-		candidates, _ := geminiChunk["candidates"].([]interface{})
-
+	for _, chunk := range chunks {
+		candidates, _ := chunk["candidates"].([]interface{})
 		for _, candidate := range candidates {
 			candMap, _ := candidate.(map[string]interface{})
 			content, _ := candMap["content"].(map[string]interface{})
 			parts, _ := content["parts"].([]interface{})
+			allParts = append(allParts, parts...)
 
-			// Process parts
-			for _, part := range parts {
-				partMap, _ := part.(map[string]interface{})
-
-				// Handle function calls - BUFFER them (don't stream yet)
-				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
-					hasToolCalls = true
-					name, _ := fnCall["name"].(string)
-					args, _ := fnCall["args"].(map[string]interface{})
-					argsJSON, _ := json.Marshal(args)
-
-					// Update or create tool call in buffer
-					if _, exists := toolCallsMap[name]; !exists {
-						toolCallsMap[name] = &SimpleToolCall{
-							Name:      name,
-							Arguments: string(argsJSON),
-						}
-						toolCallsOrder = append(toolCallsOrder, name)
-						if config.IsDebugEnabled() {
-							log.Printf("[DEBUG] Buffered new tool call: %s", name)
-						}
-					} else {
-						// Update existing (last one wins)
-						toolCallsMap[name].Arguments = string(argsJSON)
-						if config.IsDebugEnabled() {
-							log.Printf("[DEBUG] Updated buffered tool call: %s", name)
-						}
-					}
-					continue
-				}
-
-				// Handle text - STREAM IT IMMEDIATELY (live)
-				if text, ok := partMap["text"].(string); ok {
-					if thought, _ := partMap["thought"].(bool); !thought && text != "" {
-						chunk := map[string]interface{}{
-							"id":      responseID,
-							"object":  "chat.completion.chunk",
-							"created": time.Now().Unix(),
-							"model":   request.Model,
-							"choices": []map[string]interface{}{
-								{
-									"index": 0,
-									"delta": map[string]interface{}{
-										"content": text,
-									},
-									"finish_reason": nil,
-								},
-							},
-						}
-						jsonData, _ := json.Marshal(chunk)
-						fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-						flusher.Flush()
-					}
-				}
-			}
-
-			// Handle finish reason
-			if finishReason, ok := candMap["finishReason"].(string); ok && finishReason != "" && !sentFinishReason {
-				// NOW send buffered tool calls (if any)
-				if len(toolCallsMap) > 0 && !sentToolCalls {
-					toolCalls := make([]map[string]interface{}, 0, len(toolCallsOrder))
-					for idx, name := range toolCallsOrder {
-						tc := toolCallsMap[name]
-						toolCalls = append(toolCalls, map[string]interface{}{
-							"index": idx,
-							"id":    "call_" + uuid.New().String(),
-							"type":  "function",
-							"function": map[string]interface{}{
-								"name":      tc.Name,
-								"arguments": tc.Arguments,
-							},
-						})
-					}
-
-					chunk := map[string]interface{}{
-						"id":      responseID,
-						"object":  "chat.completion.chunk",
-						"created": time.Now().Unix(),
-						"model":   request.Model,
-						"choices": []map[string]interface{}{
-							{
-								"index": 0,
-								"delta": map[string]interface{}{
-									"tool_calls": toolCalls,
-								},
-								"finish_reason": nil,
-							},
-						},
-					}
-					jsonData, _ := json.Marshal(chunk)
-					fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-					flusher.Flush()
-					sentToolCalls = true
-
-					if config.IsDebugEnabled() {
-						log.Printf("[DEBUG] Sent %d buffered tool call(s)", len(toolCalls))
-					}
-				}
-
-				// Send finish reason
-				mappedFinishReason := transformers.MapFinishReason(finishReason)
-				if hasToolCalls {
-					mappedFinishReason = "tool_calls"
-				}
-
-				finishChunk := map[string]interface{}{
-					"id":      responseID,
-					"object":  "chat.completion.chunk",
-					"created": time.Now().Unix(),
-					"model":   request.Model,
-					"choices": []map[string]interface{}{
-						{
-							"index":         0,
-							"delta":         map[string]interface{}{},
-							"finish_reason": mappedFinishReason,
-						},
-					},
-				}
-				jsonData, _ := json.Marshal(finishChunk)
-				fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-				flusher.Flush()
-				sentFinishReason = true
-
-				if config.IsDebugEnabled() {
-					log.Printf("[DEBUG] Sent finish_reason: %s", mappedFinishReason)
-				}
+			if fr, ok := candMap["finishReason"].(string); ok && fr != "" {
+				lastFinishReason = fr
 			}
 		}
 	}
 
-	// Final safety net - send buffered tool calls if not sent yet
-	if len(toolCallsMap) > 0 && !sentToolCalls {
-		toolCalls := make([]map[string]interface{}, 0, len(toolCallsOrder))
-		for idx, name := range toolCallsOrder {
-			tc := toolCallsMap[name]
-			toolCalls = append(toolCalls, map[string]interface{}{
-				"index": idx,
-				"id":    "call_" + uuid.New().String(),
-				"type":  "function",
-				"function": map[string]interface{}{
-					"name":      tc.Name,
-					"arguments": tc.Arguments,
-				},
-			})
-		}
-
-		chunk := map[string]interface{}{
-			"id":      responseID,
-			"object":  "chat.completion.chunk",
-			"created": time.Now().Unix(),
-			"model":   request.Model,
-			"choices": []map[string]interface{}{
-				{
-					"index": 0,
-					"delta": map[string]interface{}{
-						"tool_calls": toolCalls,
-					},
-					"finish_reason": nil,
-				},
+	merged["candidates"] = []interface{}{
+		map[string]interface{}{
+			"index": 0,
+			"content": map[string]interface{}{
+				"role":  "model",
+				"parts": allParts,
 			},
-		}
-		jsonData, _ := json.Marshal(chunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-		flusher.Flush()
-
-		if config.IsDebugEnabled() {
-			log.Printf("[WARN] Sent %d tool call(s) at end (no finish_reason received)", len(toolCalls))
-		}
+			"finishReason": lastFinishReason,
+		},
 	}
 
-	fmt.Fprintf(w, "data: [DONE]\n\n")
-	flusher.Flush()
-	log.Printf("Completed streaming response: %s", responseID)
-}
-
-// SimpleToolCall holds tool call data
-type SimpleToolCall struct {
-	Name      string
-	Arguments string
-}
-
-// ToolCallAccumulator accumulates tool call data across chunks
-type ToolCallAccumulator struct {
-	ID        string
-	Name      string
-	Arguments string
-}
-
-// executeToolCall voert een tool call uit en retourneert het resultaat
-// Pas dit aan naar je eigen tool execution logica
-func executeToolCall(name string, arguments string) interface{} {
-	// Parse arguments
-	var args map[string]interface{}
-	if err := json.Unmarshal([]byte(arguments), &args); err != nil {
-		return map[string]interface{}{
-			"error": fmt.Sprintf("Failed to parse arguments: %v", err),
-		}
-	}
-
-	// Voer tool uit op basis van naam
-	switch name {
-	case "get_weather":
-		location := args["location"].(string)
-		return map[string]interface{}{
-			"temperature": 22,
-			"condition":   "sunny",
-			"location":    location,
-		}
-	case "search_web":
-		query := args["query"].(string)
-		return map[string]interface{}{
-			"results": []string{
-				fmt.Sprintf("Result 1 for: %s", query),
-				fmt.Sprintf("Result 2 for: %s", query),
-			},
-		}
-	default:
-		return map[string]interface{}{
-			"error": fmt.Sprintf("Unknown tool: %s", name),
-		}
-	}
+	return merged
 }
 
 func handleNonStreamingChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
-	// Send request to Gemini API
+	log.Printf("🔄 Sending non-streaming request to Gemini...")
+
 	result, err := client.SendGeminiRequest(geminiPayload, false)
 	if err != nil {
+		log.Printf("❌ Gemini request failed: %v", err)
 		errorData := map[string]interface{}{
 			"error": map[string]interface{}{
 				"message": fmt.Sprintf("Request failed: %v", err),
@@ -864,6 +710,7 @@ func handleNonStreamingChatCompletion(w http.ResponseWriter, r *http.Request, re
 
 	geminiResponse, ok := result.(map[string]interface{})
 	if !ok {
+		log.Printf("❌ Invalid response type from Gemini")
 		errorData := map[string]interface{}{
 			"error": map[string]interface{}{
 				"message": "Invalid response from API",
@@ -877,8 +724,29 @@ func handleNonStreamingChatCompletion(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	// Check for error in response
+	// DEBUG: Log Gemini response
+	if candidates, ok := geminiResponse["candidates"].([]interface{}); ok {
+		log.Printf("📥 Gemini returned %d candidates", len(candidates))
+		if len(candidates) > 0 {
+			if cand, ok := candidates[0].(map[string]interface{}); ok {
+				if content, ok := cand["content"].(map[string]interface{}); ok {
+					if parts, ok := content["parts"].([]interface{}); ok {
+						log.Printf("📦 Response has %d parts", len(parts))
+						for i, part := range parts {
+							if partMap, ok := part.(map[string]interface{}); ok {
+								isThought, _ := partMap["thought"].(bool)
+								hasText, _ := partMap["text"].(string)
+								log.Printf("  Part %d: thought=%v, hasText=%v", i, isThought, hasText != "")
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
 	if errObj, ok := geminiResponse["error"]; ok {
+		log.Printf("❌ Gemini returned error: %+v", errObj)
 		w.Header().Set("Content-Type", "application/json")
 		if errMap, ok := errObj.(map[string]interface{}); ok {
 			if code, ok := errMap["code"].(float64); ok {
@@ -893,10 +761,22 @@ func handleNonStreamingChatCompletion(w http.ResponseWriter, r *http.Request, re
 		return
 	}
 
-	// Transform to OpenAI format
+	log.Printf("🔄 Transforming Gemini → OpenAI...")
 	openaiResponse := transformers.GeminiResponseToOpenAI(geminiResponse, request.Model)
 
-	log.Printf("Successfully processed non-streaming response for model: %s", request.Model)
+	// DEBUG: Log OpenAI response
+	if choices, ok := openaiResponse["choices"].([]map[string]interface{}); ok && len(choices) > 0 {
+		message, _ := choices[0]["message"].(map[string]interface{})
+		hasContent := message["content"] != nil
+		hasReasoning := message["reasoning_content"] != nil
+		log.Printf("✅ OpenAI response: hasContent=%v, hasReasoning=%v", hasContent, hasReasoning)
+		if hasReasoning {
+			reasoningPreview := message["reasoning_content"].(string)
+			log.Printf("🧠 REASONING CONTENT PREVIEW: %s", reasoningPreview[:min(100, len(reasoningPreview))])
+		}
+	}
+
+	log.Printf("✅ Successfully processed non-streaming response for model: %s", request.Model)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(openaiResponse)
@@ -911,12 +791,10 @@ func HandleListModels(w http.ResponseWriter, r *http.Request) {
 
 	log.Println("OpenAI models list requested")
 
-	// Convert Gemini models to OpenAI format
 	openaiModels := make([]map[string]interface{}, 0)
 	for _, model := range config.SupportedModels {
 		modelID := strings.TrimPrefix(model.Name, "models/")
 
-		// Add base model
 		openaiModels = append(openaiModels, map[string]interface{}{
 			"id":       modelID,
 			"object":   "model",
@@ -942,7 +820,6 @@ func HandleListModels(w http.ResponseWriter, r *http.Request) {
 			"parent": nil,
 		})
 
-		// Add fake streaming variant only for models that support it
 		if isFakeStreamingAllowed(modelID) {
 			fakeModelID := config.GetFakeModelName(modelID)
 			openaiModels = append(openaiModels, map[string]interface{}{
@@ -981,4 +858,11 @@ func HandleListModels(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(response)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

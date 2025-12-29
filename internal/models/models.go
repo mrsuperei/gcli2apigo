@@ -5,8 +5,8 @@ package models
 type Function struct {
 	Name        string                 `json:"name"`
 	Description string                 `json:"description,omitempty"`
-	Parameters  map[string]interface{} `json:"parameters,omitempty"` // Gebruikt bij definities (JSON Schema)
-	Arguments   interface{}            `json:"arguments,omitempty"`  // Gebruikt bij tool calls (JSON String)
+	Parameters  map[string]interface{} `json:"parameters,omitempty"` // Used in definitions (JSON Schema)
+	Arguments   interface{}            `json:"arguments,omitempty"`  // Used in tool calls (JSON String)
 }
 
 type Tool struct {
@@ -53,7 +53,10 @@ type OpenAIChatCompletionRequest struct {
 	PresencePenalty  *float64               `json:"presence_penalty,omitempty"`
 	N                *int                   `json:"n,omitempty"`
 	Seed             *int                   `json:"seed,omitempty"`
-	ResponseFormat   map[string]interface{} `json:"response_format,omitempty"`
+	ResponseFormat   map[string]interface{} `json:"response_format,omitempty"`  // Supports type, json_schema
+	ReasoningEffort  string                 `json:"reasoning_effort,omitempty"` // low, medium, high
+	ThinkingTokens   *int                   `json:"thinking_tokens,omitempty"`  // Direct token count
+	ThinkingEnabled  *bool                  `json:"thinking_enabled,omitempty"` // Boolean flag (helixrun compat)
 }
 
 type OpenAIChatCompletionChoice struct {
@@ -71,6 +74,7 @@ type OpenAIChatCompletionResponse struct {
 }
 
 type OpenAIDelta struct {
+	Role             string     `json:"role,omitempty"`
 	Content          string     `json:"content,omitempty"`
 	ReasoningContent string     `json:"reasoning_content,omitempty"`
 	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`

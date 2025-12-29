@@ -520,6 +520,14 @@ func BuildGeminiPayloadFromOpenAI(openaiPayload map[string]any) map[string]any {
 			safetySettings = ssSlice
 		}
 	}
+	// NA:
+	// Haal bestaande generationConfig op uit transform
+	existingGenConfig, hasGenConfig := openaiPayload["generationConfig"].(map[string]interface{})
+	if !hasGenConfig || existingGenConfig == nil {
+		existingGenConfig = make(map[string]interface{})
+	}
+
+	log.Printf("[DEBUG] BuildGeminiPayloadFromOpenAI - generationConfig: %+v", existingGenConfig)
 
 	requestData := map[string]any{
 		"contents":         openaiPayload["contents"],
