@@ -330,10 +330,10 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 		}
 
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		defer cancel()
 
 		req, err := http.NewRequestWithContext(ctx, "POST", targetURL, buf)
 		if err != nil {
+			cancel()
 			return nil, err
 		}
 
@@ -349,6 +349,7 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 		// ===== END TIMING ACTUAL GEMINI API CALL =====
 
 		if err != nil {
+			cancel()
 			if ctx.Err() == context.DeadlineExceeded {
 				return nil, fmt.Errorf("request timeout after 5 minutes: %v", err)
 			}
@@ -357,6 +358,7 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
+			cancel()
 			log.Printf("[WARN] Received 429 (Too Many Requests) for project %s, retrying with different credential... (attempt %d/%d)",
 				projID, len(triedCredentials), maxRetries)
 
@@ -377,8 +379,11 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 		var responseErr error
 
 		if isStreaming {
-			result, responseErr = handleStreamingResponse(resp)
+			// For streaming, pass cancel to stream reader so it can cancel when done
+			result, responseErr = handleStreamingResponse(resp, cancel)
 		} else {
+			// For non-streaming, cancel context after response is handled
+			defer cancel()
 			result, responseErr = handleNonStreamingResponse(resp)
 		}
 
@@ -400,7 +405,8 @@ func SendGeminiRequest(payload map[string]any, isStreaming bool) (any, error) {
 	}
 }
 
-func handleStreamingResponse(resp *http.Response) (chan string, error) {
+// handleStreamingResponse - FIXED: TRUE ZERO BUFFERING
+func handleStreamingResponse(resp *http.Response, cancel context.CancelFunc) (chan string, error) {
 	if resp.StatusCode != http.StatusOK {
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
@@ -408,23 +414,33 @@ func handleStreamingResponse(resp *http.Response) (chan string, error) {
 		return nil, fmt.Errorf("API error: %d", resp.StatusCode)
 	}
 
-	streamChan := make(chan string, 100)
+	// Create unbuffered channel for immediate chunk forwarding
+	streamChan := make(chan string, 1) // Minimal buffer of 1
 
 	go func() {
 		defer close(streamChan)
 		defer resp.Body.Close()
+		defer cancel() // Cancel context when stream reader completes
 
-		// Stream line by line from Gemini API
+		log.Printf("🚀 [CLIENT] Starting Gemini stream reader with ZERO buffering")
+		startTime := time.Now()
+		lastChunkTime := startTime
+
+		// CRITICAL: Use bufio but forward IMMEDIATELY
 		reader := bufio.NewReader(resp.Body)
 		chunksSent := 0
+		reasoningChunks := 0
+		contentChunks := 0
 
 		for {
+			// Read line by line (SSE format)
 			line, err := reader.ReadString('\n')
 			if err != nil {
 				if err != io.EOF {
-					log.Printf("[ERROR] Error reading stream: %v", err)
+					log.Printf("❌ [CLIENT] Error reading stream: %v", err)
 				} else {
-					log.Printf("[DEBUG] Stream EOF reached after %d chunks", chunksSent)
+					totalTime := time.Since(startTime).Milliseconds()
+					log.Printf("✅ [CLIENT] Stream EOF reached - Total chunks: %d (reasoning: %d, content: %d), Total time: %dms", chunksSent, reasoningChunks, contentChunks, totalTime)
 				}
 				break
 			}
@@ -434,34 +450,101 @@ func handleStreamingResponse(resp *http.Response) (chan string, error) {
 				continue
 			}
 
-			// Use CutPrefix to avoid double prefix check and allocation
+			// Parse SSE data line
 			if chunk, found := strings.CutPrefix(line, "data: "); found {
 				if chunk == "[DONE]" {
-					log.Printf("[DEBUG] Received [DONE] marker after sending %d chunks", chunksSent)
+					log.Printf("🏁 [CLIENT] Received [DONE] marker - Total chunks: %d (reasoning: %d, content: %d)", chunksSent, reasoningChunks, contentChunks)
 					break
 				}
 
+				// Validate JSON
 				var obj map[string]any
 				if err := json.Unmarshal([]byte(chunk), &obj); err != nil {
-					log.Printf("[WARN] Failed to parse chunk: %v (size: %d)", err, len(chunk))
+					log.Printf("⚠️  [CLIENT] Failed to parse chunk: %v (size: %d)", err, len(chunk))
 					continue
 				}
 
-				// Extract response object if present, otherwise send raw chunk
+				// DIAGNOSTIC: Check chunk structure before sending
+				chunkToSend := chunk
+				hasResponseWrapper := false
 				if response, ok := obj["response"].(map[string]any); ok {
 					responseJSON, _ := json.Marshal(response)
-					streamChan <- string(responseJSON)
-				} else {
-					streamChan <- chunk
+					chunkToSend = string(responseJSON)
+					hasResponseWrapper = true
+
+					// DIAGNOSTIC: Analyze response structure
+					if candidates, ok := response["candidates"].([]interface{}); ok && len(candidates) > 0 {
+						if cand, ok := candidates[0].(map[string]interface{}); ok {
+							if content, ok := cand["content"].(map[string]interface{}); ok {
+								if parts, ok := content["parts"].([]interface{}); ok {
+									for _, part := range parts {
+										if partMap, ok := part.(map[string]interface{}); ok {
+											if thought, hasThought := partMap["thought"].(bool); hasThought && thought {
+												reasoningChunks++
+											} else if text, hasText := partMap["text"].(string); hasText && text != "" {
+												contentChunks++
+											}
+										}
+									}
+								}
+							}
+						}
+					}
 				}
 
+				// TIMING DIAGNOSTIC: Calculate time since last chunk
+				now := time.Now()
+				timeSinceLastChunk := now.Sub(lastChunkTime).Milliseconds()
+				timeSinceStart := now.Sub(startTime).Milliseconds()
+				lastChunkTime = now
+
+				// DIAGNOSTIC: Log first 10 chunks in detail with timing
+				if chunksSent < 10 {
+					log.Printf("📦 [CLIENT] Chunk #%d (raw): %s", chunksSent+1, chunkToSend[:min(300, len(chunkToSend))])
+					log.Printf("  └─ Has 'response' wrapper: %v", hasResponseWrapper)
+					log.Printf("  └─ Time since last chunk: %dms, Time since start: %dms", timeSinceLastChunk, timeSinceStart)
+					log.Printf("  └─ Parts in this chunk: analyzing...")
+
+					// Analyze parts in detail
+					if hasResponseWrapper {
+						var response map[string]any
+						json.Unmarshal([]byte(chunkToSend), &response)
+						if candidates, ok := response["candidates"].([]interface{}); ok && len(candidates) > 0 {
+							if cand, ok := candidates[0].(map[string]interface{}); ok {
+								if content, ok := cand["content"].(map[string]interface{}); ok {
+									if parts, ok := content["parts"].([]interface{}); ok {
+										log.Printf("  └─ Number of parts in this chunk: %d", len(parts))
+										for i, part := range parts {
+											if partMap, ok := part.(map[string]interface{}); ok {
+												if _, hasThought := partMap["thought"].(bool); hasThought {
+													if text, hasText := partMap["text"].(string); hasText {
+														log.Printf("    Part %d: THOUGHT, text length: %d, preview: '%s'", i, len(text), text[:min(50, len(text))])
+													}
+												} else if text, hasText := partMap["text"].(string); hasText {
+													log.Printf("    Part %d: CONTENT, text length: %d, preview: '%s'", i, len(text), text[:min(50, len(text))])
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+
+				// Send chunk to channel
+				streamChan <- chunkToSend
 				chunksSent++
-				if chunksSent%10 == 0 {
-					log.Printf("[DEBUG] Sent %d chunks to handler", chunksSent)
+
+				// CRITICAL: Log frequently to verify real-time behavior
+				if chunksSent%5 == 0 {
+					log.Printf("📤 [CLIENT] Forwarded %d chunks (reasoning: %d, content: %d), Last chunk delay: %dms", chunksSent, reasoningChunks, contentChunks, timeSinceLastChunk)
 				}
 			}
 		}
-		log.Printf("[DEBUG] Stream complete: sent %d chunks total", chunksSent)
+
+		totalTime := time.Since(startTime).Milliseconds()
+		log.Printf("✅ [CLIENT] Stream reader complete: forwarded %d chunks total (reasoning: %d, content: %d), Total time: %dms", chunksSent, reasoningChunks, contentChunks, totalTime)
 	}()
 
 	return streamChan, nil

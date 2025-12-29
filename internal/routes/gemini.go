@@ -12,6 +12,9 @@ import (
 	"gcli2apigo/internal/auth"
 	"gcli2apigo/internal/client"
 	"gcli2apigo/internal/config"
+	"gcli2apigo/internal/transformers"
+
+	"github.com/google/uuid"
 )
 
 // HandleGeminiListModels handles native Gemini models endpoint
@@ -183,6 +186,7 @@ func HandleGeminiProxy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleGeminiStreamingResponse - FIXED: Transform Gemini chunks to OpenAI format with ZERO BUFFERING
 func handleGeminiStreamingResponse(w http.ResponseWriter, result interface{}) {
 	streamChan, ok := result.(chan string)
 	if !ok {
@@ -214,75 +218,233 @@ func handleGeminiStreamingResponse(w http.ResponseWriter, result interface{}) {
 		return
 	}
 
-	// Smart buffering: accumulate chunks and flush on sentence boundaries or time
-	var chunkAccumulator strings.Builder
-	chunkAccumulator.Grow(8 * 1024) // Pre-allocate 8KB
+	log.Printf("🚀 [GEMINI-NATIVE] Starting Gemini native streaming with OpenAI format transformation")
 
-	lastFlushTime := time.Now()
-	flushInterval := 50 * time.Millisecond
+	responseID := "chatcmpl-" + uuid.New().String()
+	createdTime := time.Now().Unix()
 
-	// Sentence boundary detection
-	isSentenceBoundary := func(text string) bool {
-		if len(text) == 0 {
-			return false
-		}
-		// Check last rune for sentence boundaries (supports Unicode)
-		runes := []rune(text)
-		lastRune := runes[len(runes)-1]
-		return lastRune == '.' || lastRune == '!' || lastRune == '?' ||
-			lastRune == '。' || lastRune == '！' || lastRune == '？' ||
-			lastRune == '\n'
-	}
+	// Send initial chunk with role
+	sendStreamChunk(w, flusher, map[string]interface{}{
+		"id":      responseID,
+		"object":  "chat.completion.chunk",
+		"created": createdTime,
+		"model":   "gemini-pro",
+		"choices": []map[string]interface{}{
+			{
+				"index": 0,
+				"delta": map[string]interface{}{
+					"role": "assistant",
+				},
+				"finish_reason": nil,
+			},
+		},
+	})
+	log.Printf("📤 [GEMINI-NATIVE] Sent initial chunk with role")
 
-	sendAccumulatedChunk := func() {
-		if chunkAccumulator.Len() == 0 {
-			return
-		}
+	chunkCount := 0
+	reasoningChunks := 0
+	contentChunks := 0
+	toolCallsBuffer := make([]map[string]interface{}, 0)
+	var lastFinishReason string
 
-		fmt.Fprintf(w, "data: %s\n\n", chunkAccumulator.String())
-		flusher.Flush()
-
-		chunkAccumulator.Reset()
-		lastFlushTime = time.Now()
-	}
-
+	// CRITICAL FIX: Transform each Gemini chunk to OpenAI format and send immediately
 	for chunk := range streamChan {
-		chunkAccumulator.WriteString(chunk)
+		chunkCount++
 
-		// Extract text to check for sentence boundaries
 		var geminiChunk map[string]interface{}
-		if err := json.Unmarshal([]byte(chunk), &geminiChunk); err == nil {
-			candidates, _ := geminiChunk["candidates"].([]interface{})
-			for _, candidate := range candidates {
-				candMap, _ := candidate.(map[string]interface{})
-				content, _ := candMap["content"].(map[string]interface{})
-				parts, _ := content["parts"].([]interface{})
+		if err := json.Unmarshal([]byte(chunk), &geminiChunk); err != nil {
+			log.Printf("⚠️  [GEMINI-NATIVE] Chunk %d: Parse error: %v", chunkCount, err)
+			continue
+		}
 
-				var textContent string
-				for _, part := range parts {
-					partMap, _ := part.(map[string]interface{})
-					if text, ok := partMap["text"].(string); ok {
-						textContent += text
+		// DIAGNOSTIC: Log first 5 chunks in detail
+		if chunkCount <= 5 {
+			log.Printf("📦 [GEMINI-NATIVE] Chunk #%d received (raw): %s", chunkCount, chunk[:min(300, len(chunk))])
+
+			// Analyze chunk structure
+			if candidates, ok := geminiChunk["candidates"].([]interface{}); ok {
+				log.Printf("  └─ Has 'candidates': YES (count: %d)", len(candidates))
+				if len(candidates) > 0 {
+					if cand, ok := candidates[0].(map[string]interface{}); ok {
+						if content, ok := cand["content"].(map[string]interface{}); ok {
+							if parts, ok := content["parts"].([]interface{}); ok {
+								log.Printf("  └─ Parts count: %d", len(parts))
+							}
+						}
 					}
 				}
+			}
+		}
 
-				// Flush conditions:
-				// 1. Sentence boundary detected
-				// 2. Time interval exceeded (50ms)
-				// 3. Buffer size exceeded (8KB safety limit)
-				timeSinceFlush := time.Since(lastFlushTime)
+		// Check for errors
+		if errObj, ok := geminiChunk["error"]; ok {
+			log.Printf("❌ Error in chunk %d: %+v", chunkCount, errObj)
+			sendStreamChunk(w, flusher, map[string]interface{}{
+				"id":      responseID,
+				"object":  "chat.completion.chunk",
+				"created": createdTime,
+				"model":   "gemini-pro",
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"delta":         map[string]interface{}{},
+						"finish_reason": "error",
+					},
+				},
+				"error": errObj,
+			})
+			break
+		}
 
-				if isSentenceBoundary(textContent) ||
-					timeSinceFlush >= flushInterval ||
-					chunkAccumulator.Len() >= 8*1024 {
-					sendAccumulatedChunk()
-					return
+		candidates, _ := geminiChunk["candidates"].([]interface{})
+
+		for _, candidate := range candidates {
+			candMap, _ := candidate.(map[string]interface{})
+			content, _ := candMap["content"].(map[string]interface{})
+			parts, _ := content["parts"].([]interface{})
+
+			// Process each part IMMEDIATELY
+			for partIdx, part := range parts {
+				partMap, _ := part.(map[string]interface{})
+
+				// Log part details in first chunks
+				if chunkCount <= 3 {
+					log.Printf("  Part %d: %+v", partIdx, partMap)
 				}
+
+				// Handle tool calls - BUFFER them (required for valid JSON)
+				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
+					name, _ := fnCall["name"].(string)
+					args, _ := fnCall["args"].(map[string]interface{})
+					argsJSON, _ := json.Marshal(args)
+
+					toolCall := map[string]interface{}{
+						"index": len(toolCallsBuffer),
+						"id":    "call_" + uuid.New().String(),
+						"type":  "function",
+						"function": map[string]interface{}{
+							"name":      name,
+							"arguments": string(argsJSON),
+						},
+					}
+					toolCallsBuffer = append(toolCallsBuffer, toolCall)
+
+					log.Printf("🔧 [GEMINI-NATIVE] Buffered tool call %d: %s", len(toolCallsBuffer), name)
+					continue
+				}
+
+				// Handle text content - IMMEDIATE STREAMING
+				if text, ok := partMap["text"].(string); ok {
+					if text == "" {
+						continue
+					}
+
+					// Check if this is reasoning/thinking content
+					isThought, _ := partMap["thought"].(bool)
+
+					delta := map[string]interface{}{}
+					if isThought {
+						delta["reasoning_content"] = text
+						reasoningChunks++
+						if reasoningChunks <= 5 {
+							log.Printf("🧠 [GEMINI-NATIVE] REASONING chunk %d: %s", reasoningChunks, text[:min(50, len(text))])
+						}
+					} else {
+						delta["content"] = text
+						contentChunks++
+						if contentChunks <= 5 {
+							log.Printf("💬 [GEMINI-NATIVE] Content chunk %d: %s", contentChunks, text[:min(50, len(text))])
+						}
+					}
+
+					// DIAGNOSTIC: Log chunk being sent
+					if reasoningChunks+contentChunks <= 10 {
+						log.Printf("📤 [GEMINI-NATIVE] Sending OpenAI chunk #%d: type=%s, text='%s'",
+							reasoningChunks+contentChunks,
+							map[bool]string{true: "reasoning", false: "content"}[isThought],
+							text[:min(50, len(text))])
+					}
+
+					// CRITICAL: Send chunk IMMEDIATELY and FLUSH
+					sendStreamChunk(w, flusher, map[string]interface{}{
+						"id":      responseID,
+						"object":  "chat.completion.chunk",
+						"created": createdTime,
+						"model":   "gemini-pro",
+						"choices": []map[string]interface{}{
+							{
+								"index":         0,
+								"delta":         delta,
+								"finish_reason": nil,
+							},
+						},
+					})
+				}
+			}
+
+			// Handle finish reason
+			if finishReason, ok := candMap["finishReason"].(string); ok && finishReason != "" {
+				lastFinishReason = finishReason
+				log.Printf("🏁 [GEMINI-NATIVE] Finish reason detected: %s", finishReason)
 			}
 		}
 	}
 
-	sendAccumulatedChunk() // Final flush
+	log.Printf("📊 [GEMINI-NATIVE] Stream processing completed:")
+	log.Printf("  - Total Gemini chunks received: %d", chunkCount)
+	log.Printf("  - Content chunks sent: %d", contentChunks)
+	log.Printf("  - Reasoning chunks sent: %d", reasoningChunks)
+	log.Printf("  - Tool calls buffered: %d", len(toolCallsBuffer))
+	log.Printf("  - Total OpenAI chunks sent: %d", contentChunks+reasoningChunks)
+
+	// Send buffered tool calls if any
+	if len(toolCallsBuffer) > 0 {
+		sendStreamChunk(w, flusher, map[string]interface{}{
+			"id":      responseID,
+			"object":  "chat.completion.chunk",
+			"created": createdTime,
+			"model":   "gemini-pro",
+			"choices": []map[string]interface{}{
+				{
+					"index": 0,
+					"delta": map[string]interface{}{
+						"tool_calls": toolCallsBuffer,
+					},
+					"finish_reason": nil,
+				},
+			},
+		})
+		log.Printf("🔧 [GEMINI-NATIVE] Sent %d buffered tool calls", len(toolCallsBuffer))
+	}
+
+	// Send finish reason
+	if lastFinishReason != "" {
+		mappedFinishReason := transformers.MapFinishReason(lastFinishReason)
+		if len(toolCallsBuffer) > 0 {
+			mappedFinishReason = "tool_calls"
+		}
+
+		sendStreamChunk(w, flusher, map[string]interface{}{
+			"id":      responseID,
+			"object":  "chat.completion.chunk",
+			"created": createdTime,
+			"model":   "gemini-pro",
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": mappedFinishReason,
+				},
+			},
+		})
+		log.Printf("🏁 [GEMINI-NATIVE] Sent finish_reason: %v", mappedFinishReason)
+	}
+
+	// Send [DONE]
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+
+	log.Printf("✅ [GEMINI-NATIVE] Stream COMPLETE: %s", responseID)
 }
 
 func handleGeminiNonStreamingResponse(w http.ResponseWriter, result interface{}, modelName string) {

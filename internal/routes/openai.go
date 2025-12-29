@@ -208,6 +208,7 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 // handleTrueLiveStreamingChatCompletion implements TRUE LIVE STREAMING with ZERO buffering
 func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Request, request *models.OpenAIChatCompletionRequest, geminiPayload map[string]interface{}) {
+	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -219,40 +220,21 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	log.Printf("🚀 Starting TRUE LIVE STREAMING")
+	log.Printf("🚀 Starting TRUE LIVE STREAMING for model: %s", request.Model)
 
 	// Send request to Gemini with streaming enabled
+	requestStartTime := time.Now()
 	result, err := client.SendGeminiRequest(geminiPayload, true)
 	if err != nil {
 		log.Printf("❌ Gemini request failed: %v", err)
-		errorChunk := map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": fmt.Sprintf("Request failed: %v", err),
-				"type":    "api_error",
-				"code":    500,
-			},
-		}
-		jsonData, _ := json.Marshal(errorChunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		sendStreamError(w, flusher, err)
 		return
 	}
 
 	streamChan, ok := result.(chan string)
 	if !ok {
 		log.Printf("❌ Invalid stream channel type")
-		errorChunk := map[string]interface{}{
-			"error": map[string]interface{}{
-				"message": "Streaming request failed",
-				"type":    "api_error",
-				"code":    500,
-			},
-		}
-		jsonData, _ := json.Marshal(errorChunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-		fmt.Fprintf(w, "data: [DONE]\n\n")
-		flusher.Flush()
+		sendStreamError(w, flusher, fmt.Errorf("streaming request failed"))
 		return
 	}
 
@@ -262,7 +244,7 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 	log.Printf("✅ Stream channel received, response ID: %s", responseID)
 
 	// Send initial chunk with role
-	initialChunk := map[string]interface{}{
+	sendStreamChunk(w, flusher, map[string]interface{}{
 		"id":      responseID,
 		"object":  "chat.completion.chunk",
 		"created": createdTime,
@@ -276,38 +258,82 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 				"finish_reason": nil,
 			},
 		},
-	}
-	jsonData, _ := json.Marshal(initialChunk)
-	fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-	flusher.Flush()
+	})
 	log.Printf("📤 Sent initial chunk with role")
 
-	// Process stream chunks with ZERO buffering
+	// Process stream chunks with TRUE ZERO BUFFERING
 	chunkCount := 0
 	var lastFinishReason string
 	toolCallsBuffer := make([]map[string]interface{}, 0)
-	toolCallsSent := false
 	reasoningChunks := 0
 	contentChunks := 0
+	firstChunkReceived := false
+	_ = time.Time{} // Placeholder for future use
+	lastChunkTime := time.Now()
+
+	log.Printf("🚀 [OPENAI] Starting chunk processing loop - waiting for chunks from client...")
 
 	for geminiChunkStr := range streamChan {
+		now := time.Now()
+		if !firstChunkReceived {
+			firstChunkReceived = true
+			timeToFirstChunk := now.Sub(requestStartTime).Milliseconds()
+			log.Printf("⏱️  [OPENAI] First chunk received after %dms", timeToFirstChunk)
+		}
+		timeSinceLastChunk := now.Sub(lastChunkTime).Milliseconds()
+		timeSinceStart := now.Sub(requestStartTime).Milliseconds()
+		lastChunkTime = now
+
 		chunkCount++
 
 		var geminiChunk map[string]interface{}
 		if err := json.Unmarshal([]byte(geminiChunkStr), &geminiChunk); err != nil {
-			log.Printf("⚠️  Chunk %d: Parse error: %v", chunkCount, err)
+			log.Printf("⚠️  [OPENAI] Chunk %d: Parse error: %v", chunkCount, err)
 			continue
 		}
 
-		// DEBUG: Log eerste paar chunks
-		if chunkCount <= 3 {
-			log.Printf("📦 Chunk %d received: %s", chunkCount, geminiChunkStr[:min(200, len(geminiChunkStr))])
+		// DIAGNOSTIC: Log first 10 chunks in detail with timing
+		if chunkCount <= 10 {
+			log.Printf("📦 [OPENAI] Chunk #%d received (raw): %s", chunkCount, geminiChunkStr[:min(300, len(geminiChunkStr))])
+			log.Printf("  └─ Time since last chunk: %dms, Time since start: %dms", timeSinceLastChunk, timeSinceStart)
+
+			// Analyze chunk structure
+			if candidates, ok := geminiChunk["candidates"].([]interface{}); ok {
+				log.Printf("  └─ Has 'candidates': YES (count: %d)", len(candidates))
+				if len(candidates) > 0 {
+					if cand, ok := candidates[0].(map[string]interface{}); ok {
+						if content, ok := cand["content"].(map[string]interface{}); ok {
+							if parts, ok := content["parts"].([]interface{}); ok {
+								log.Printf("  └─ Parts count: %d", len(parts))
+								for i, part := range parts {
+									if partMap, ok := part.(map[string]interface{}); ok {
+										if _, hasThought := partMap["thought"].(bool); hasThought {
+											if text, hasText := partMap["text"].(string); hasText {
+												log.Printf("  └─ Part %d: thought=true, text length=%d, preview='%s'", i, len(text), text[:min(50, len(text))])
+											} else {
+												log.Printf("  └─ Part %d: thought=true, NO TEXT", i)
+											}
+										} else if text, hasText := partMap["text"].(string); hasText {
+											log.Printf("  └─ Part %d: thought=false, text='%s'", i, text[:min(50, len(text))])
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			} else {
+				log.Printf("  └─ Has 'candidates': NO - checking other fields...")
+				for k, v := range geminiChunk {
+					log.Printf("  └─ Field '%s': %v", k, v)
+				}
+			}
 		}
 
 		// Check for errors
 		if errObj, ok := geminiChunk["error"]; ok {
 			log.Printf("❌ Error in chunk %d: %+v", chunkCount, errObj)
-			errorChunk := map[string]interface{}{
+			sendStreamChunk(w, flusher, map[string]interface{}{
 				"id":      responseID,
 				"object":  "chat.completion.chunk",
 				"created": createdTime,
@@ -320,10 +346,7 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 					},
 				},
 				"error": errObj,
-			}
-			jsonData, _ := json.Marshal(errorChunk)
-			fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-			flusher.Flush()
+			})
 			break
 		}
 
@@ -334,16 +357,16 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 			content, _ := candMap["content"].(map[string]interface{})
 			parts, _ := content["parts"].([]interface{})
 
-			// Process each part
+			// Process each part IMMEDIATELY
 			for partIdx, part := range parts {
 				partMap, _ := part.(map[string]interface{})
 
-				// DEBUG: Log part details in eerste chunks
+				// Log part details in first chunks
 				if chunkCount <= 3 {
 					log.Printf("  Part %d: %+v", partIdx, partMap)
 				}
 
-				// Handle tool calls - BUFFER them
+				// Handle tool calls - BUFFER them (required for valid JSON)
 				if fnCall, ok := partMap["functionCall"].(map[string]interface{}); ok {
 					name, _ := fnCall["name"].(string)
 					args, _ := fnCall["args"].(map[string]interface{})
@@ -377,16 +400,27 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 					if isThought {
 						delta["reasoning_content"] = text
 						reasoningChunks++
-						log.Printf("🧠 REASONING chunk %d: %s", reasoningChunks, text[:min(50, len(text))])
+						if reasoningChunks <= 5 {
+							log.Printf("🧠 [OPENAI] REASONING chunk %d: %s", reasoningChunks, text[:min(50, len(text))])
+						}
 					} else {
 						delta["content"] = text
 						contentChunks++
 						if contentChunks <= 5 {
-							log.Printf("💬 Content chunk %d: %s", contentChunks, text[:min(50, len(text))])
+							log.Printf("💬 [OPENAI] Content chunk %d: %s", contentChunks, text[:min(50, len(text))])
 						}
 					}
 
-					chunk := map[string]interface{}{
+					// DIAGNOSTIC: Log chunk being sent
+					if reasoningChunks+contentChunks <= 10 {
+						log.Printf("📤 [OPENAI] Sending OpenAI chunk #%d: type=%s, text='%s'",
+							reasoningChunks+contentChunks,
+							map[bool]string{true: "reasoning", false: "content"}[isThought],
+							text[:min(50, len(text))])
+					}
+
+					// CRITICAL: Send chunk IMMEDIATELY and FLUSH
+					sendStreamChunk(w, flusher, map[string]interface{}{
 						"id":      responseID,
 						"object":  "chat.completion.chunk",
 						"created": createdTime,
@@ -398,11 +432,18 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 								"finish_reason": nil,
 							},
 						},
+					})
+				} else {
+					// FALLBACK: Log parts that don't match expected structure for debugging
+					if chunkCount <= 5 {
+						log.Printf("⚠️  [OPENAI] Part %d has no 'text' field - structure: %+v", partIdx, partMap)
+						// Log all keys in the part for debugging
+						keys := make([]string, 0, len(partMap))
+						for k := range partMap {
+							keys = append(keys, k)
+						}
+						log.Printf("  └─ Part keys: %v", keys)
 					}
-
-					jsonData, _ := json.Marshal(chunk)
-					fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-					flusher.Flush() // CRITICAL: Flush immediately!
 				}
 			}
 
@@ -414,15 +455,16 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	log.Printf("📊 Stream completed:")
-	log.Printf("  - Total chunks: %d", chunkCount)
-	log.Printf("  - Content chunks: %d", contentChunks)
-	log.Printf("  - Reasoning chunks: %d", reasoningChunks)
-	log.Printf("  - Tool calls: %d", len(toolCallsBuffer))
+	log.Printf("📊 [OPENAI] Stream processing completed:")
+	log.Printf("  - Total Gemini chunks received: %d", chunkCount)
+	log.Printf("  - Content chunks sent: %d", contentChunks)
+	log.Printf("  - Reasoning chunks sent: %d", reasoningChunks)
+	log.Printf("  - Tool calls buffered: %d", len(toolCallsBuffer))
+	log.Printf("  - Total OpenAI chunks sent: %d", contentChunks+reasoningChunks)
 
 	// Send buffered tool calls if any
-	if len(toolCallsBuffer) > 0 && !toolCallsSent {
-		toolCallChunk := map[string]interface{}{
+	if len(toolCallsBuffer) > 0 {
+		sendStreamChunk(w, flusher, map[string]interface{}{
 			"id":      responseID,
 			"object":  "chat.completion.chunk",
 			"created": createdTime,
@@ -436,10 +478,7 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 					"finish_reason": nil,
 				},
 			},
-		}
-		jsonData, _ := json.Marshal(toolCallChunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-		flusher.Flush()
+		})
 		log.Printf("🔧 Sent %d buffered tool calls", len(toolCallsBuffer))
 	}
 
@@ -450,7 +489,7 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 			mappedFinishReason = "tool_calls"
 		}
 
-		finishChunk := map[string]interface{}{
+		sendStreamChunk(w, flusher, map[string]interface{}{
 			"id":      responseID,
 			"object":  "chat.completion.chunk",
 			"created": createdTime,
@@ -462,10 +501,7 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 					"finish_reason": mappedFinishReason,
 				},
 			},
-		}
-		jsonData, _ := json.Marshal(finishChunk)
-		fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
-		flusher.Flush()
+		})
 		log.Printf("🏁 Sent finish_reason: %v", mappedFinishReason)
 	}
 
@@ -474,6 +510,61 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 	flusher.Flush()
 
 	log.Printf("✅ Stream COMPLETE: %s", responseID)
+}
+
+// sendStreamChunk sends a single chunk and flushes immediately
+var chunkSendCount = 0
+var firstChunkSentTime time.Time
+
+func sendStreamChunk(w http.ResponseWriter, flusher http.Flusher, chunk map[string]interface{}) {
+	now := time.Now()
+	if chunkSendCount == 0 {
+		firstChunkSentTime = now
+	}
+	chunkSendCount++
+
+	jsonData, _ := json.Marshal(chunk)
+
+	// DIAGNOSTIC: Log chunk being sent with timing
+	if choices, ok := chunk["choices"].([]interface{}); ok && len(choices) > 0 {
+		if choice, ok := choices[0].(map[string]interface{}); ok {
+			if delta, ok := choice["delta"].(map[string]interface{}); ok {
+				if reasoning, hasReasoning := delta["reasoning_content"].(string); hasReasoning {
+					log.Printf("📡 [OPENAI] SENDING chunk #%d: type=reasoning, text='%s', size=%d bytes",
+						chunkSendCount, reasoning[:min(50, len(reasoning))], len(jsonData))
+				} else if content, hasContent := delta["content"].(string); hasContent {
+					log.Printf("📡 [OPENAI] SENDING chunk #%d: type=content, text='%s', size=%d bytes",
+						chunkSendCount, content[:min(50, len(content))], len(jsonData))
+				} else {
+					log.Printf("📡 [OPENAI] SENDING chunk #%d: type=empty_delta, size=%d bytes", chunkSendCount, len(jsonData))
+				}
+			}
+		}
+	}
+
+	fmt.Fprintf(w, "data: %s\n\n", string(jsonData))
+	flusher.Flush() // CRITICAL: Flush immediately!
+
+	// Log every 10th chunk with timing
+	if chunkSendCount%10 == 0 {
+		elapsed := now.Sub(firstChunkSentTime).Milliseconds()
+		log.Printf("⏱️  [OPENAI] Sent %d chunks in %dms (avg: %.2fms/chunk)",
+			chunkSendCount, elapsed, float64(elapsed)/float64(chunkSendCount))
+	}
+}
+
+// sendStreamError sends an error in streaming format
+func sendStreamError(w http.ResponseWriter, flusher http.Flusher, err error) {
+	errorChunk := map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": fmt.Sprintf("Request failed: %v", err),
+			"type":    "api_error",
+			"code":    500,
+		},
+	}
+	sendStreamChunk(w, flusher, errorChunk)
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
 }
 
 // handleFakeStreamChatCompletion handles fake streaming (buffer then stream complete response)
