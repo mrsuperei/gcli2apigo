@@ -67,6 +67,20 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Model: %s", request.Model)
 	log.Printf("Stream: %v", request.Stream)
 
+	// DIAGNOSTIC: Log ALL fields in the raw request to identify what trpc-agent-go is sending
+	var rawRequest map[string]interface{}
+	if err := json.Unmarshal(body, &rawRequest); err == nil {
+		log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+		log.Printf("🔍 RAW REQUEST FIELDS (all keys):")
+		for key, value := range rawRequest {
+			// Log all fields except messages (too large)
+			if key != "messages" {
+				log.Printf("  - %s: %v (%T)", key, value, value)
+			}
+		}
+		log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	}
+
 	// Check BOTH locations for reasoning_effort
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Printf("🧠 REASONING/THINKING CHECK:")
@@ -78,11 +92,25 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		log.Printf("  ❌ thinking_tokens: not set")
 	}
 
+	// Check thinking_enabled (boolean flag)
+	if request.ThinkingEnabled != nil {
+		log.Printf("  ✅ thinking_enabled: %v", *request.ThinkingEnabled)
+	} else {
+		log.Printf("  ❌ thinking_enabled: not set")
+	}
+
 	// Check reasoning_effort (low/medium/high)
 	if request.ReasoningEffort != "" {
 		log.Printf("  ✅ reasoning_effort: '%s'", request.ReasoningEffort)
 	} else {
 		log.Printf("  ❌ reasoning_effort: not set")
+	}
+
+	// Check max_tokens (traditional OpenAI field)
+	if request.MaxTokens != nil {
+		log.Printf("  ✅ max_tokens: %d", *request.MaxTokens)
+	} else {
+		log.Printf("  ❌ max_tokens: not set")
 	}
 
 	// Check response_format fallbacks
@@ -93,11 +121,31 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		if tokens, ok := request.ResponseFormat["thinking_tokens"].(float64); ok {
 			log.Printf("  ⚠️  response_format.thinking_tokens: %d (deprecated)", int(tokens))
 		}
+		if enabled, ok := request.ResponseFormat["thinking_enabled"].(bool); ok {
+			log.Printf("  ⚠️  response_format.thinking_enabled: %v (deprecated)", enabled)
+		}
 		if len(request.ResponseFormat) > 0 {
 			log.Printf("  Response Format: %+v", request.ResponseFormat)
 		}
 	} else {
 		log.Printf("  Response Format: nil")
+	}
+
+	// Check nested GenerationConfig (trpc-agent-go format)
+	if request.GenerationConfig != nil {
+		log.Printf("  🔍 GenerationConfig (trpc-agent-go): %+v", *request.GenerationConfig)
+		genCfg := *request.GenerationConfig
+		if tokens, ok := genCfg["thinking_tokens"].(float64); ok {
+			log.Printf("    ✅ generation_config.thinking_tokens: %d", int(tokens))
+		}
+		if enabled, ok := genCfg["thinking_enabled"].(bool); ok {
+			log.Printf("    ✅ generation_config.thinking_enabled: %v", enabled)
+		}
+		if tokens, ok := genCfg["max_tokens"].(float64); ok {
+			log.Printf("    ✅ generation_config.max_tokens: %d", int(tokens))
+		}
+	} else {
+		log.Printf("  ❌ GenerationConfig: not set")
 	}
 	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	log.Printf("═══════════════════════════════════════════════════")

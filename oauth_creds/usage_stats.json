@@ -1,18 +1,18 @@
 {
   "compact-cell-480622-c2": {
     "project_id": "compact-cell-480622-c2",
-    "pro_model_count": 18,
-    "overall_count": 18,
-    "last_reset_time": "2025-12-29T08:00:00.0008356+01:00",
-    "last_update_time": "2025-12-29T21:29:27.3082077+01:00",
+    "pro_model_count": 0,
+    "overall_count": 1,
+    "last_reset_time": "2026-01-02T08:00:01.8107648+01:00",
+    "last_update_time": "2026-01-02T21:13:18.3476979+01:00",
     "last_error_code": 0
   },
   "gen-lang-client-0264464366": {
     "project_id": "gen-lang-client-0264464366",
-    "pro_model_count": 8,
-    "overall_count": 8,
-    "last_reset_time": "2025-12-29T15:00:00+08:00",
-    "last_update_time": "2025-12-29T21:06:33.4178439+01:00",
+    "pro_model_count": 1,
+    "overall_count": 1,
+    "last_reset_time": "2026-01-02T08:00:01.8107648+01:00",
+    "last_update_time": "2026-01-02T21:53:57.109226+01:00",
     "last_error_code": 0
   }
 }

@@ -40,23 +40,24 @@ type ImageURL struct {
 }
 
 type OpenAIChatCompletionRequest struct {
-	Model            string                 `json:"model"`
-	Messages         []OpenAIChatMessage    `json:"messages"`
-	Tools            []Tool                 `json:"tools,omitempty"`
-	ToolChoice       interface{}            `json:"tool_choice,omitempty"`
-	Stream           bool                   `json:"stream,omitempty"`
-	Temperature      *float64               `json:"temperature,omitempty"`
-	TopP             *float64               `json:"top_p,omitempty"`
-	MaxTokens        *int                   `json:"max_tokens,omitempty"`
-	Stop             interface{}            `json:"stop,omitempty"` // Can be string or []string
-	FrequencyPenalty *float64               `json:"frequency_penalty,omitempty"`
-	PresencePenalty  *float64               `json:"presence_penalty,omitempty"`
-	N                *int                   `json:"n,omitempty"`
-	Seed             *int                   `json:"seed,omitempty"`
-	ResponseFormat   map[string]interface{} `json:"response_format,omitempty"`  // Supports type, json_schema
-	ReasoningEffort  string                 `json:"reasoning_effort,omitempty"` // low, medium, high
-	ThinkingTokens   *int                   `json:"thinking_tokens,omitempty"`  // Direct token count
-	ThinkingEnabled  *bool                  `json:"thinking_enabled,omitempty"` // Boolean flag (helixrun compat)
+	Model            string                  `json:"model"`
+	Messages         []OpenAIChatMessage     `json:"messages"`
+	Tools            []Tool                  `json:"tools,omitempty"`
+	ToolChoice       interface{}             `json:"tool_choice,omitempty"`
+	Stream           bool                    `json:"stream,omitempty"`
+	Temperature      *float64                `json:"temperature,omitempty"`
+	TopP             *float64                `json:"top_p,omitempty"`
+	MaxTokens        *int                    `json:"max_tokens,omitempty"`
+	Stop             interface{}             `json:"stop,omitempty"` // Can be string or []string
+	FrequencyPenalty *float64                `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64                `json:"presence_penalty,omitempty"`
+	N                *int                    `json:"n,omitempty"`
+	Seed             *int                    `json:"seed,omitempty"`
+	ResponseFormat   map[string]interface{}  `json:"response_format,omitempty"`   // Supports type, json_schema
+	ReasoningEffort  string                  `json:"reasoning_effort,omitempty"`  // low, medium, high
+	ThinkingTokens   *int                    `json:"thinking_tokens,omitempty"`   // Direct token count
+	ThinkingEnabled  *bool                   `json:"thinking_enabled,omitempty"`  // Boolean flag (helixrun compat)
+	GenerationConfig *map[string]interface{} `json:"generation_config,omitempty"` // trpc-agent-go compatibility
 }
 
 type OpenAIChatCompletionChoice struct {

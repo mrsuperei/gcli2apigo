@@ -304,14 +304,51 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 	log.Printf("[DEBUG] req.ThinkingTokens = %v", req.ThinkingTokens)
 	log.Printf("[DEBUG] req.ThinkingEnabled = %v", req.ThinkingEnabled)
 
+	// PRIORITY 0: Check nested GenerationConfig (trpc-agent-go format)
+	if req.GenerationConfig != nil {
+		genCfg := *req.GenerationConfig
+
+		// Check thinking_tokens in nested config
+		if tokens, ok := genCfg["thinking_tokens"].(float64); ok && tokens > 0 {
+			thinkingBudget = int(tokens)
+			log.Printf("[DEBUG] ✅ Using thinking_tokens from nested generation_config → %d", thinkingBudget)
+		}
+
+		// Check thinking_enabled in nested config
+		if thinkingBudget == 0 {
+			if enabled, ok := genCfg["thinking_enabled"].(bool); ok && enabled {
+				if req.MaxTokens != nil && *req.MaxTokens > 0 {
+					thinkingBudget = *req.MaxTokens
+				} else {
+					thinkingBudget = 4096 // Default medium budget
+				}
+				log.Printf("[DEBUG] ✅ Using thinking_enabled from nested generation_config → %d", thinkingBudget)
+			}
+		}
+
+		// Check max_tokens in nested config
+		if thinkingBudget == 0 {
+			if tokens, ok := genCfg["max_tokens"].(float64); ok && tokens > 0 {
+				thinkingBudget = int(tokens)
+				log.Printf("[DEBUG] ✅ Using max_tokens from nested generation_config → %d", thinkingBudget)
+			}
+		}
+	}
+
 	// PRIORITY 1: Direct token count (thinking_tokens)
 	if req.ThinkingTokens != nil && *req.ThinkingTokens > 0 {
 		thinkingBudget = *req.ThinkingTokens
 		log.Printf("[DEBUG] ✅ Using direct thinking_tokens: %d", thinkingBudget)
 	} else if req.ThinkingEnabled != nil && *req.ThinkingEnabled {
-		// PRIORITY 2: Boolean flag (thinking_enabled) - use default budget
-		thinkingBudget = 4096 // Default medium budget
-		log.Printf("[DEBUG] ✅ Using thinking_enabled flag → default budget: %d", thinkingBudget)
+		// PRIORITY 2: Boolean flag (thinking_enabled)
+		// Use MaxTokens if available, otherwise use default budget
+		if req.MaxTokens != nil && *req.MaxTokens > 0 {
+			thinkingBudget = *req.MaxTokens
+			log.Printf("[DEBUG] ✅ Using thinking_enabled flag with MaxTokens: %d", thinkingBudget)
+		} else {
+			thinkingBudget = 4096 // Default medium budget
+			log.Printf("[DEBUG] ✅ Using thinking_enabled flag → default budget: %d", thinkingBudget)
+		}
 	} else if req.ReasoningEffort != "" {
 		// PRIORITY 3: Reasoning effort (low/medium/high)
 		thinkingBudget = ReasoningEffortToThinkingBudget(req.ReasoningEffort)
