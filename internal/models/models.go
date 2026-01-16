@@ -1,5 +1,20 @@
 package models
 
+// Usage represents token usage statistics (OpenAI format)
+type Usage struct {
+	PromptTokens            int                      `json:"prompt_tokens"`
+	CompletionTokens        int                      `json:"completion_tokens"`
+	TotalTokens             int                      `json:"total_tokens"`
+	CompletionTokensDetails *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// CompletionTokensDetails provides breakdown of completion tokens
+type CompletionTokensDetails struct {
+	ReasoningTokens          int `json:"reasoning_tokens,omitempty"`
+	AcceptedPredictionTokens int `json:"accepted_prediction_tokens,omitempty"`
+	RejectedPredictionTokens int `json:"rejected_prediction_tokens,omitempty"`
+}
+
 // OpenAI Models
 
 type Function struct {
@@ -72,6 +87,7 @@ type OpenAIChatCompletionResponse struct {
 	Created int64                        `json:"created"`
 	Model   string                       `json:"model"`
 	Choices []OpenAIChatCompletionChoice `json:"choices"`
+	Usage   *Usage                       `json:"usage,omitempty"`
 }
 
 type OpenAIDelta struct {
@@ -93,6 +109,7 @@ type OpenAIChatCompletionStreamResponse struct {
 	Created int64                              `json:"created"`
 	Model   string                             `json:"model"`
 	Choices []OpenAIChatCompletionStreamChoice `json:"choices"`
+	Usage   *Usage                             `json:"usage,omitempty"`
 }
 
 // Gemini Models
@@ -141,4 +158,30 @@ type GeminiCandidate struct {
 
 type GeminiResponse struct {
 	Candidates []GeminiCandidate `json:"candidates"`
+}
+
+// ThinkingSupport represents thinking/reasoning capabilities for a model
+type ThinkingSupport struct {
+	Min            int      `json:"min"`
+	Max            int      `json:"max"`
+	ZeroAllowed    bool     `json:"zeroAllowed"`
+	DynamicAllowed bool     `json:"dynamicAllowed"`
+	Levels         []string `json:"levels,omitempty"`
+}
+
+// ModelInfo represents detailed information about a model
+type ModelInfo struct {
+	ID                         string           `json:"id"`
+	Object                     string           `json:"object"`
+	Created                    int64            `json:"created"`
+	OwnedBy                    string           `json:"owned_by"`
+	Type                       string           `json:"type"`
+	Name                       string           `json:"name"`
+	Version                    string           `json:"version"`
+	DisplayName                string           `json:"displayName"`
+	Description                string           `json:"description"`
+	InputTokenLimit            int              `json:"inputTokenLimit"`
+	OutputTokenLimit           int              `json:"outputTokenLimit"`
+	SupportedGenerationMethods []string         `json:"supportedGenerationMethods"`
+	Thinking                   *ThinkingSupport `json:"thinking,omitempty"`
 }

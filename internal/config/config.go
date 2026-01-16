@@ -241,48 +241,101 @@ type Model struct {
 	MaxTemperature             float64  `json:"maxTemperature"`
 	TopP                       float64  `json:"topP"`
 	TopK                       int      `json:"topK"`
+	ThinkingMin                int      `json:"thinkingMin"`
+	ThinkingMax                int      `json:"thinkingMax"`
+	ThinkingZeroAllowed        bool     `json:"thinkingZeroAllowed"`
+	ThinkingDynamicAllowed     bool     `json:"thinkingDynamicAllowed"`
+	ThinkingLevels             []string `json:"thinkingLevels,omitempty"`
 }
 
-// BaseModels (without search variants) - Updated with latest models as of October 2025
+// BaseModels (without search variants) - Updated with latest models as of January 2026
 var BaseModels = []Model{
 	{
-		Name:                       "models/gemini-2.5-pro-preview-06-05",
-		Version:                    "002",
-		DisplayName:                "Gemini 2.5 Pro Preview 0605",
-		Description:                "Gemini 2.5 Pro Preview 0605",
-		InputTokenLimit:            1048576,
-		OutputTokenLimit:           65535,
-		SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent"},
-		Temperature:                1.0,
-		MaxTemperature:             2.0,
-		TopP:                       0.95,
-		TopK:                       64,
-	},
-	{
 		Name:                       "models/gemini-2.5-pro",
-		Version:                    "002",
+		Version:                    "2.5",
 		DisplayName:                "Gemini 2.5 Pro",
-		Description:                "Gemini 2.5 Pro",
+		Description:                "Stable release (June 17th, 2025) of Gemini 2.5 Pro",
 		InputTokenLimit:            1048576,
-		OutputTokenLimit:           65535,
-		SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent"},
+		OutputTokenLimit:           65536,
+		SupportedGenerationMethods: []string{"generateContent", "countTokens", "createCachedContent", "batchGenerateContent"},
 		Temperature:                1.0,
 		MaxTemperature:             2.0,
 		TopP:                       0.95,
 		TopK:                       64,
+		ThinkingMin:                128,
+		ThinkingMax:                32768,
+		ThinkingZeroAllowed:        false,
+		ThinkingDynamicAllowed:     true,
 	},
 	{
 		Name:                       "models/gemini-2.5-flash",
-		Version:                    "002",
+		Version:                    "001",
 		DisplayName:                "Gemini 2.5 Flash",
-		Description:                "Gemini 2.5 Flash",
+		Description:                "Stable version of Gemini 2.5 Flash, our mid-size multimodal model that supports up to 1 million tokens, released in June of 2025.",
 		InputTokenLimit:            1048576,
-		OutputTokenLimit:           65535,
-		SupportedGenerationMethods: []string{"generateContent", "streamGenerateContent"},
+		OutputTokenLimit:           65536,
+		SupportedGenerationMethods: []string{"generateContent", "countTokens", "createCachedContent", "batchGenerateContent"},
 		Temperature:                1.0,
 		MaxTemperature:             2.0,
 		TopP:                       0.95,
 		TopK:                       64,
+		ThinkingMin:                0,
+		ThinkingMax:                24576,
+		ThinkingZeroAllowed:        true,
+		ThinkingDynamicAllowed:     true,
+	},
+	{
+		Name:                       "models/gemini-2.5-flash-lite",
+		Version:                    "2.5",
+		DisplayName:                "Gemini 2.5 Flash Lite",
+		Description:                "Our smallest and most cost effective model, built for at scale usage.",
+		InputTokenLimit:            1048576,
+		OutputTokenLimit:           65536,
+		SupportedGenerationMethods: []string{"generateContent", "countTokens", "createCachedContent", "batchGenerateContent"},
+		Temperature:                1.0,
+		MaxTemperature:             2.0,
+		TopP:                       0.95,
+		TopK:                       64,
+		ThinkingMin:                0,
+		ThinkingMax:                24576,
+		ThinkingZeroAllowed:        true,
+		ThinkingDynamicAllowed:     true,
+	},
+	{
+		Name:                       "models/gemini-3-pro-preview",
+		Version:                    "3.0",
+		DisplayName:                "Gemini 3 Pro Preview",
+		Description:                "Our most intelligent model with SOTA reasoning and multimodal understanding, and powerful agentic and vibe coding capabilities",
+		InputTokenLimit:            1048576,
+		OutputTokenLimit:           65536,
+		SupportedGenerationMethods: []string{"generateContent", "countTokens", "createCachedContent", "batchGenerateContent"},
+		Temperature:                1.0,
+		MaxTemperature:             2.0,
+		TopP:                       0.95,
+		TopK:                       64,
+		ThinkingMin:                128,
+		ThinkingMax:                32768,
+		ThinkingZeroAllowed:        false,
+		ThinkingDynamicAllowed:     true,
+		ThinkingLevels:             []string{"low", "high"},
+	},
+	{
+		Name:                       "models/gemini-3-flash-preview",
+		Version:                    "3.0",
+		DisplayName:                "Gemini 3 Flash Preview",
+		Description:                "Our most intelligent model built for speed, combining frontier intelligence with superior search and grounding.",
+		InputTokenLimit:            1048576,
+		OutputTokenLimit:           65536,
+		SupportedGenerationMethods: []string{"generateContent", "countTokens", "createCachedContent", "batchGenerateContent"},
+		Temperature:                1.0,
+		MaxTemperature:             2.0,
+		TopP:                       0.95,
+		TopK:                       64,
+		ThinkingMin:                128,
+		ThinkingMax:                32768,
+		ThinkingZeroAllowed:        false,
+		ThinkingDynamicAllowed:     true,
+		ThinkingLevels:             []string{"minimal", "low", "medium", "high"},
 	},
 }
 
@@ -347,4 +400,3 @@ func GetClientMetadata(projectID string) map[string]any {
 		"duetProject": projectID,
 	}
 }
-

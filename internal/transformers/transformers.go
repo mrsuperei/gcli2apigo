@@ -508,11 +508,15 @@ func OpenAIRequestToGemini(req *models.OpenAIChatCompletionRequest) map[string]i
 }
 
 // GeminiResponseToOpenAI transforms a Gemini API response to OpenAI chat completion format
-// Now with enhanced reasoning content handling
+// Now with enhanced reasoning content handling and usage metadata
 func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map[string]interface{} {
 	choices := make([]map[string]interface{}, 0)
 
 	candidates, _ := geminiResp["candidates"].([]interface{})
+
+	// Count reasoning tokens for usage metadata
+	reasoningTokenCount := 0
+
 	for _, candidate := range candidates {
 		candMap, _ := candidate.(map[string]interface{})
 		content, _ := candMap["content"].(map[string]interface{})
@@ -548,6 +552,8 @@ func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map
 			if text, ok := partMap["text"].(string); ok {
 				if thought, _ := partMap["thought"].(bool); thought {
 					reasoningContent += text
+					// Estimate reasoning tokens (rough approximation: ~4 chars per token)
+					reasoningTokenCount += len(text) / 4
 				} else {
 					contentParts = append(contentParts, text)
 				}
@@ -604,13 +610,60 @@ func GeminiResponseToOpenAI(geminiResp map[string]interface{}, model string) map
 		})
 	}
 
-	return map[string]interface{}{
+	// Extract usage from Gemini response
+	usage := ExtractUsageFromGeminiResponse(geminiResp, reasoningTokenCount)
+
+	response := map[string]interface{}{
 		"id":      "chatcmpl-" + uuid.New().String(),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
 		"model":   model,
 		"choices": choices,
 	}
+
+	// Add usage if available
+	if usage != nil {
+		response["usage"] = usage
+	}
+
+	return response
+}
+
+// ExtractUsageFromGeminiResponse extracts token usage from Gemini response
+// Returns nil if usageMetadata is not present in the response
+func ExtractUsageFromGeminiResponse(geminiResp map[string]interface{}, reasoningTokenCount int) *models.Usage {
+	// Check for usageMetadata in Gemini response
+	usageMetadata, hasMetadata := geminiResp["usageMetadata"].(map[string]interface{})
+
+	if !hasMetadata {
+		return nil
+	}
+
+	usage := &models.Usage{}
+
+	// Extract prompt tokens
+	if promptTokens, ok := usageMetadata["promptTokenCount"].(float64); ok {
+		usage.PromptTokens = int(promptTokens)
+	}
+
+	// Extract completion tokens
+	if completionTokens, ok := usageMetadata["candidatesTokenCount"].(float64); ok {
+		usage.CompletionTokens = int(completionTokens)
+	}
+
+	// Extract total tokens
+	if totalTokens, ok := usageMetadata["totalTokenCount"].(float64); ok {
+		usage.TotalTokens = int(totalTokens)
+	}
+
+	// Add completion_tokens_details if we have reasoning tokens
+	if reasoningTokenCount > 0 {
+		usage.CompletionTokensDetails = &models.CompletionTokensDetails{
+			ReasoningTokens: reasoningTokenCount,
+		}
+	}
+
+	return usage
 }
 
 // MapFinishReason converts Gemini finish reasons to OpenAI format

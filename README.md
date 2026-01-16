@@ -19,38 +19,27 @@ OpenAI-compatible API proxy for Google's Gemini models with OAuth credential man
 
 ### Basic Models
 
-- gemini-2.5-pro
-- gemini-2.5-pro-preview-03-25
-- gemini-2.5-pro-preview-05-06
-- gemini-2.5-pro-preview-06-05
-- gemini-flash-latest
-- gemini-2.5-flash
-- gemini-2.5-flash-preview-05-20
-- gemini-2.5-flash-preview-04-17
-- gemini-2.5-flash-image-preview
-- gemini-2.5-flash-image
+- gemini-2.5-pro - Stable release (June 17th, 2025) of Gemini 2.5 Pro
+- gemini-2.5-flash - Stable version of Gemini 2.5 Flash, mid-size multimodal model with 1M token support
+- gemini-2.5-flash-lite - Smallest and most cost effective model, built for at scale usage
+- gemini-3-pro-preview - Most intelligent model with SOTA reasoning and multimodal understanding
+- gemini-3-flash-preview - Most intelligent model built for speed with superior search and grounding
 
 ### Fake Streaming Variations (EN)
 
 - gemini-2.5-pro-fake
-- gemini-2.5-pro-preview-03-25-fake
-- gemini-2.5-pro-preview-05-06-fake
-- gemini-2.5-pro-preview-06-05-fake
-- gemini-flash-latest-fake
 - gemini-2.5-flash-fake
-- gemini-2.5-flash-preview-05-20-fake
-- gemini-2.5-flash-preview-04-17-fake
+- gemini-2.5-flash-lite-fake
+- gemini-3-pro-preview-fake
+- gemini-3-flash-preview-fake
 
 ### Fake Streaming Variations (ZH)
 
 - 假流式/gemini-2.5-pro
-- 假流式/gemini-2.5-pro-preview-03-25
-- 假流式/gemini-2.5-pro-preview-05-06
-- 假流式/gemini-2.5-pro-preview-06-05
-- 假流式/gemini-flash-latest
 - 假流式/gemini-2.5-flash
-- 假流式/gemini-2.5-flash-preview-05-20
-- 假流式/gemini-2.5-flash-preview-04-17
+- 假流式/gemini-2.5-flash-lite
+- 假流式/gemini-3-pro-preview
+- 假流式/gemini-3-flash-preview
 
 ### Instructions
 
@@ -150,7 +139,7 @@ curl -X POST http://localhost:7860/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_PASSWORD" \
   -d '{
-    "model": "gemini-2.0-flash-exp",
+    "model": "gemini-2.5-pro",
     "messages": [{"role": "user", "content": "Hello!"}]
   }'
 
@@ -163,7 +152,7 @@ curl http://localhost:7860/v1/models \
 
 ```bash
 # Generate content
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.0-flash-exp/generateContent \
+curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-pro/generateContent \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_PASSWORD" \
   -d '{
@@ -171,7 +160,7 @@ curl -X POST http://localhost:7860/v1beta/models/gemini-2.0-flash-exp/generateCo
   }'
 
 # Stream generate content
-curl -X POST http://localhost:7860/v1beta/models/gemini-2.0-flash-exp/streamGenerateContent \
+curl -X POST http://localhost:7860/v1beta/models/gemini-2.5-pro/streamGenerateContent \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_PASSWORD" \
   -d '{

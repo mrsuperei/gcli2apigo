@@ -23,14 +23,26 @@ import (
 func isFakeStreamingAllowed(modelName string) bool {
 	modelName = strings.TrimPrefix(modelName, "models/")
 
+	// Gemini 2.5 Pro series
 	if strings.HasPrefix(modelName, "gemini-2.5-pro") {
 		return true
 	}
 
-	if strings.Contains(modelName, "gemini-flash") || strings.Contains(modelName, "gemini-2.5-flash") {
+	// Gemini 2.5 Flash series (excluding image variants)
+	if strings.Contains(modelName, "gemini-2.5-flash") {
 		if strings.Contains(modelName, "flash-image") {
 			return false
 		}
+		return true
+	}
+
+	// Gemini 3 Pro Preview
+	if strings.HasPrefix(modelName, "gemini-3-pro-preview") {
+		return true
+	}
+
+	// Gemini 3 Flash Preview
+	if strings.HasPrefix(modelName, "gemini-3-flash-preview") {
 		return true
 	}
 
@@ -319,6 +331,10 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 	_ = time.Time{} // Placeholder for future use
 	lastChunkTime := time.Now()
 
+	// Track reasoning tokens for usage metadata
+	reasoningTokenCount := 0
+	var finalGeminiChunk map[string]interface{}
+
 	log.Printf("🚀 [OPENAI] Starting chunk processing loop - waiting for chunks from client...")
 
 	for geminiChunkStr := range streamChan {
@@ -448,6 +464,8 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 					if isThought {
 						delta["reasoning_content"] = text
 						reasoningChunks++
+						// Track reasoning tokens for usage (approximate: ~4 chars per token)
+						reasoningTokenCount += len(text) / 4
 						if reasoningChunks <= 5 {
 							log.Printf("🧠 [OPENAI] REASONING chunk %d: %s", reasoningChunks, text[:min(50, len(text))])
 						}
@@ -501,6 +519,9 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 				log.Printf("🏁 Finish reason detected: %s", finishReason)
 			}
 		}
+
+		// Store final chunk for usage extraction
+		finalGeminiChunk = geminiChunk
 	}
 
 	log.Printf("📊 [OPENAI] Stream processing completed:")
@@ -551,6 +572,32 @@ func handleTrueLiveStreamingChatCompletion(w http.ResponseWriter, r *http.Reques
 			},
 		})
 		log.Printf("🏁 Sent finish_reason: %v", mappedFinishReason)
+	}
+
+	// Extract and send usage metadata from final chunk
+	if finalGeminiChunk != nil {
+		usage := transformers.ExtractUsageFromGeminiResponse(finalGeminiChunk, reasoningTokenCount)
+		if usage != nil {
+			sendStreamChunk(w, flusher, map[string]interface{}{
+				"id":      responseID,
+				"object":  "chat.completion.chunk",
+				"created": createdTime,
+				"model":   request.Model,
+				"choices": []map[string]interface{}{
+					{
+						"index":         0,
+						"delta":         map[string]interface{}{},
+						"finish_reason": nil,
+					},
+				},
+				"usage": usage,
+			})
+			log.Printf("📊 Sent usage: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
+				usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+			if usage.CompletionTokensDetails != nil && usage.CompletionTokensDetails.ReasoningTokens > 0 {
+				log.Printf("🧠 Reasoning tokens: %d", usage.CompletionTokensDetails.ReasoningTokens)
+			}
+		}
 	}
 
 	// Send [DONE]
@@ -753,6 +800,12 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		choices = choicesRaw
 	}
 
+	// Extract usage from response
+	var usage *models.Usage
+	if usageRaw, ok := openaiResponse["usage"].(*models.Usage); ok {
+		usage = usageRaw
+	}
+
 	// Build streaming chunk
 	streamingChoices := make([]map[string]interface{}, 0)
 	for _, choiceMap := range choices {
@@ -781,6 +834,16 @@ func handleFakeStreamChatCompletion(w http.ResponseWriter, r *http.Request, requ
 		"created": openaiResponse["created"],
 		"model":   request.Model,
 		"choices": streamingChoices,
+	}
+
+	// Add usage if available
+	if usage != nil {
+		streamChunk["usage"] = usage
+		log.Printf("📊 Fake stream usage: prompt_tokens=%d, completion_tokens=%d, total_tokens=%d",
+			usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens)
+		if usage.CompletionTokensDetails != nil && usage.CompletionTokensDetails.ReasoningTokens > 0 {
+			log.Printf("🧠 Fake stream reasoning tokens: %d", usage.CompletionTokensDetails.ReasoningTokens)
+		}
 	}
 
 	jsonData, _ := json.Marshal(streamChunk)
